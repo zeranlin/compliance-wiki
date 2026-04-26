@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""用 OpenAI 兼容小模型验证 1 个 BD 检查点执行说明书 + 1 份待审文件。"""
+"""用 OpenAI 兼容小模型验证 BD 检查点执行说明书 + 1 份待审文件。"""
 
 from __future__ import annotations
 
@@ -18,89 +18,12 @@ from typing import Any
 
 WORKSPACE_ROOT = Path.cwd()
 DEFAULT_OUTPUT_ROOT = WORKSPACE_ROOT / "validation" / "cli-runs"
-DEFAULT_BASE_URL = os.environ.get("CHECKPOINT_LLM_BASE_URL", "http://112.111.54.86:10011/v1")
-DEFAULT_MODEL = os.environ.get("CHECKPOINT_LLM_MODEL", "qwen3.5-27b")
-DEFAULT_API_KEY = os.environ.get("CHECKPOINT_LLM_API_KEY", "bssc")
-
-MODE_DEFAULTS: dict[str, dict[str, Any]] = {
-    "quick": {
-        "jobs": 10,
-        "max_tokens": 3072,
-        "fast_skip": True,
-        "two_stage": True,
-        "stage1_min_score": 8,
-    },
-    "standard": {
-        "jobs": 10,
-        "max_tokens": 4096,
-        "fast_skip": True,
-        "two_stage": True,
-        "stage1_min_score": 6,
-    },
-    "strict": {
-        "jobs": 8,
-        "max_tokens": 6144,
-        "fast_skip": True,
-        "two_stage": True,
-        "stage1_min_score": 5,
-    },
-    "sop-validation": {
-        "jobs": 8,
-        "max_tokens": 6144,
-        "fast_skip": False,
-        "two_stage": False,
-        "stage1_min_score": 0,
-    },
-}
-
-DOMAIN_STAGE1_THRESHOLDS: dict[str, dict[str, int]] = {
-    "quick": {
-        "BD01": 8,
-        "BD02": 8,
-        "BD03": 7,
-        "BD04": 7,
-        "BD05": 7,
-        "BD06": 6,
-        "BD07": 6,
-        "BD08": 7,
-        "BD09": 6,
-        "BD10": 7,
-        "BD11": 7,
-        "BD12": 6,
-        "BD13": 7,
-    },
-    "standard": {
-        "BD01": 8,
-        "BD02": 8,
-        "BD03": 6,
-        "BD04": 6,
-        "BD05": 6,
-        "BD06": 5,
-        "BD07": 5,
-        "BD08": 6,
-        "BD09": 5,
-        "BD10": 6,
-        "BD11": 6,
-        "BD12": 5,
-        "BD13": 6,
-    },
-    "strict": {
-        "BD01": 6,
-        "BD02": 6,
-        "BD03": 5,
-        "BD04": 5,
-        "BD05": 5,
-        "BD06": 4,
-        "BD07": 4,
-        "BD08": 5,
-        "BD09": 4,
-        "BD10": 5,
-        "BD11": 5,
-        "BD12": 4,
-        "BD13": 5,
-    },
-    "sop-validation": {},
-}
+DEFAULT_JOBS = 8
+DEFAULT_MAX_TOKENS = 6144
+DEFAULT_MIN_CANDIDATE_SCORE = 3
+ENV_BASE_URL = "CHECKPOINT_LLM_BASE_URL"
+ENV_MODEL = "CHECKPOINT_LLM_MODEL"
+ENV_API_KEY = "CHECKPOINT_LLM_API_KEY"
 
 
 def read_text(path: Path) -> str:
@@ -132,6 +55,11 @@ def relative_path(path: Path) -> str:
         return str(path)
 
 
+def display_file_name(value: Any) -> str:
+    text = str(value or "").strip()
+    return Path(text).name if text else ""
+
+
 def under_path(path: Path, parent: Path) -> bool:
     try:
         path.resolve().relative_to(parent.resolve())
@@ -144,6 +72,21 @@ def validate_output_dir(output_dir: Path) -> None:
     forbidden = WORKSPACE_ROOT / "wiki" / "audits"
     if under_path(output_dir, forbidden):
         raise RuntimeError("checkpoint CLI 输出不得写入 wiki/audits，请使用 validation/cli-runs。")
+
+
+def resolve_llm_config(args: argparse.Namespace) -> None:
+    args.base_url = args.base_url or os.environ.get(ENV_BASE_URL)
+    args.model = args.model or os.environ.get(ENV_MODEL)
+    args.api_key = args.api_key or os.environ.get(ENV_API_KEY)
+    missing = []
+    if not args.base_url:
+        missing.append(ENV_BASE_URL)
+    if not args.model:
+        missing.append(ENV_MODEL)
+    if not args.api_key:
+        missing.append(ENV_API_KEY)
+    if missing:
+        raise RuntimeError("缺少模型连接配置，请通过环境变量或命令行参数提供：" + "、".join(missing))
 
 
 def extract_text_from_docx(path: Path) -> tuple[str, str]:
@@ -318,150 +261,25 @@ def parse_keyword_groups(markdown: str) -> dict[str, list[str]]:
     return {key: value for key, value in groups.items() if value}
 
 
-def numbered_lines(text: str) -> list[str]:
-    return [f"{idx:04d}: {line}" for idx, line in enumerate(source_lines(text), start=1)]
-
-
 def line_has_any(line: str, words: list[str]) -> list[str]:
     return [word for word in words if word and word in line]
 
 
-def checkpoint_required_pattern_groups(checkpoint_id: str, checkpoint_title: str) -> list[list[str]]:
-    """Return AND groups used to suppress noisy one-word recalls."""
-    title = f"{checkpoint_id} {checkpoint_title}"
-    bd01_groups = {
-        "BD01-001": [["注册地", "住所地", "经营地", "本地", "当地", "深圳", "宝安"], ["资格", "评分", "得分", "加分", "无效", "必须", "须", "不得"]],
-        "BD01-002": [["分支机构", "办事处", "服务点", "本地服务", "售后服务点"], ["资格", "评分", "得分", "加分", "无效", "必须", "须", "不得"]],
-        "BD01-003": [["距离", "车程", "响应半径", "公里", "分钟", "小时内", "到达"], ["资格", "评分", "得分", "加分", "无效", "必须", "须", "不得"]],
-        "BD01-004": [["登记", "注册", "备案", "入库", "报名"], ["采购活动前", "投标前", "参与", "资格", "评分", "无效", "必须", "须"]],
-        "BD01-005": [["平台", "系统", "入驻", "账号", "软件"], ["提前", "投标前", "参与", "资格", "评分", "无效", "必须", "须", "购买"]],
-        "BD01-006": [["备选库", "名录库", "资格库", "供应商库", "库内"], ["准入", "资格", "评分", "得分", "加分", "无效", "必须", "须"]],
-        "BD01-007": [["指定软件", "软件", "客户端", "系统", "平台", "工具"], ["购买", "安装", "使用", "参与", "投标", "资格", "评分", "无效", "必须", "须"]],
-        "BD01-008": [["国有", "民营", "外资", "中外合资", "所有制"], ["资格", "评分", "得分", "加分", "无效", "必须", "须", "不得"]],
-        "BD01-009": [["组织形式", "法人", "事业单位", "社会组织", "企业"], ["资格", "评分", "得分", "加分", "无效", "必须", "须", "不得"]],
-        "BD01-010": [["股权", "控股", "参股", "股东", "出资"], ["资格", "评分", "得分", "加分", "无效", "必须", "须", "不得"]],
-        "BD01-011": [["内资", "外资", "国别", "投资者", "境外"], ["资格", "评分", "得分", "加分", "无效", "必须", "须", "不得"]],
-    }
-    if checkpoint_id in bd01_groups:
-        return bd01_groups[checkpoint_id]
-
-    bd02_groups = {
-        "BD02-001": [["经营年限", "成立年限", "成立时间", "注册年限", "不少于", "满"], ["资格", "评分", "得分", "加分", "无效", "必须", "须"]],
-        "BD02-002": [["注册资本", "注册资金", "实缴资本"], ["资格", "评分", "得分", "加分", "无效", "必须", "须"]],
-        "BD02-003": [["资产总额", "净资产", "总资产"], ["资格", "评分", "得分", "加分", "无效", "必须", "须"]],
-        "BD02-004": [["营业收入", "销售额", "销售收入", "年收入"], ["资格", "评分", "得分", "加分", "无效", "必须", "须"]],
-        "BD02-005": [["利润", "净利润", "利润率", "盈利"], ["资格", "评分", "得分", "加分", "无效", "必须", "须"]],
-        "BD02-006": [["纳税额", "税收", "纳税证明", "税收贡献"], ["资格", "评分", "得分", "加分", "无效", "必须", "须"]],
-        "BD02-007": [["从业人员", "团队规模", "员工人数", "人员数量"], ["企业规模", "资格", "评分", "得分", "加分", "无效", "必须", "须"]],
-        "BD02-008": [["经营范围", "营业执照", "特定字样", "包含"], ["资格", "评分", "得分", "加分", "无效", "必须", "须"]],
-    }
-    if checkpoint_id in bd02_groups:
-        return bd02_groups[checkpoint_id]
-
-    bd04_groups = {
-        "BD04-001": [["采购需求", "需求", "服务内容", "技术要求", "商务要求"], ["不完整", "矛盾", "歧义", "不一致", "缺少", "未明确", "详见附件"]],
-        "BD04-002": [["采购标的", "功能", "目标", "应用场景", "服务内容"], ["未明确", "缺少", "不清", "详见附件", "需求"]],
-        "BD04-003": [["标准", "规范", "执行标准", "国家标准", "行业标准", "技术标准"], ["未明确", "缺少", "不清", "应符合", "验收", "检测"]],
-        "BD04-004": [["技术要求", "技术参数", "指标", "参数", "性能"], ["未明确", "缺少", "不低于", "不少于", "优于", "满足", "评分", "负偏离"]],
-        "BD04-005": [["商务要求", "履约", "服务期限", "交付", "付款", "验收"], ["未明确", "缺少", "不清", "条件", "责任"]],
-        "BD04-006": [["采购需求", "项目特点", "实际需要", "服务内容", "设备"], ["不符合", "超出", "无关", "不必要", "不合理"]],
-        "BD04-007": [["预算", "资产配置", "办公需要", "配置标准", "数量", "金额"], ["超出", "高于", "超过", "不合理", "不必要"]],
-        "BD04-008": [["分包", "转包", "分包内容", "分包金额", "分包比例"], ["允许", "未明确", "缺少", "比例", "金额"]],
-    }
-    if checkpoint_id in bd04_groups:
-        return bd04_groups[checkpoint_id]
-
-    bd05_groups = {
-        "BD05-001": [["特定供应商", "唯一", "指定", "原厂", "厂家", "品牌", "型号"], ["技术", "商务", "资格", "评分", "参数", "必须", "须", "无效"]],
-        "BD05-002": [["技术参数", "参数组合", "规格", "型号", "配置"], ["唯一", "特定", "指向", "品牌", "厂家", "满足", "负偏离"]],
-        "BD05-003": [["品牌", "型号", "商标", "制造商", "厂家"], ["指定", "限定", "唯一", "相当于", "参考", "或同等"]],
-        "BD05-004": [["专利", "专有技术", "著作权", "软著"], ["指定", "必须", "须", "评分", "得分", "加分", "无效"]],
-        "BD05-005": [["参数", "指标", "规格", "配置", "组合"], ["唯一", "特定", "指向", "同时满足", "全部满足", "负偏离"]],
-        "BD05-006": [["原厂授权", "制造商授权", "厂家授权", "原厂证明", "制造商证明"], ["资格", "评分", "得分", "无效", "必须", "须", "门槛"]],
-        "BD05-007": [["厂家彩页", "说明书", "检测报告", "技术参数证明", "截图", "证明材料"], ["参数", "负偏离", "不得分", "无效", "必须", "须", "过密", "过细"]],
-    }
-    if checkpoint_id in bd05_groups:
-        return bd05_groups[checkpoint_id]
-
-    if checkpoint_id == "BD11-003":
-        return [
-            ["澄清", "修改", "更正", "答疑", "补遗"],
-            ["顺延", "延期", "截止", "开标", "提交", "影响投标文件编制", "不足十五", "不足15"],
-        ]
-    if checkpoint_id == "BD11-001":
-        return [
-            ["公告", "更正公告", "投标邀请", "采购文件", "投标人须知", "前附表"],
-            ["预算", "最高限价", "资格", "评标方法", "采购方式", "截止", "开标", "项目名称", "项目编号"],
-        ]
-    if checkpoint_id == "BD11-002":
-        return [
-            ["项目名称", "项目编号", "预算", "最高限价", "采购需求", "资格要求", "获取采购文件", "提交截止", "开标", "联系人", "联系方式", "公告期限"],
-            ["空白", "缺失", "未明确", "另行通知", "详见公告", "详见附件", "待定"],
-        ]
-    if checkpoint_id == "BD13-002":
-        return [
-            ["检测报告", "认证证书", "合同业绩", "验收报告", "发票", "查询截图", "第三方证明", "原件", "证书"],
-            ["高分", "得分", "不得分", "缺一", "必须", "须", "无效", "截图", "协会", "平台", "原件备查", "特定"],
-        ]
-    if checkpoint_id in {"BD13-004", "BD13-005", "BD13-006", "BD13-007"}:
-        return [
-            ["不同投标", "供应商", "投标人", "报价", "账户", "机器码", "创建标识码", "文件作者", "保证金"],
-            ["一致", "相同", "同一", "规律", "异常", "转出"],
-        ]
-    if "澄清修改" in title:
-        return [["澄清", "修改", "更正", "答疑", "补遗"], ["顺延", "截止", "开标", "提交"]]
-    return []
-
-
-def line_matches_required_groups(line: str, required_groups: list[list[str]]) -> bool:
-    if not required_groups:
-        return True
-    return all(any(word in line for word in group) for group in required_groups)
-
-
-def is_response_format_line(line: str) -> bool:
-    return any(
-        word in line
-        for word in [
-            "投标函",
-            "声明函",
-            "授权委托书",
-            "承诺函",
-            "报价表",
-            "格式自拟",
-            "单位名称",
-            "项目名称）",
-            "（项目名称）",
-            "（标的名称）",
-        ]
+def has_scoring_weight_structure(line: str) -> bool:
+    """识别待审文件中的评分权重结构，用于补充上下文而非判断风险。"""
+    compact = re.sub(r"\s+", "", line)
+    return bool(
+        re.search(r"权重(?:\(%\)|（%）|百分比|比例)?", compact)
+        or re.search(r"评标总得分|综合得分|价格分|技术分|商务分", compact)
+        or re.search(r"F\d*[=＝].*A\d*", compact)
+        or re.search(r"(评分因素|评分项|评分准则|评分标准)", compact)
     )
-
-
-def is_static_warning_line(line: str) -> bool:
-    return any(
-        phrase in line
-        for phrase in [
-            "如有虚假，将依法承担相应责任",
-            "提供虚假材料谋取中标",
-            "追究相应责任",
-            "不得提供虚假材料",
-            "法律法规规定追究",
-        ]
-    )
-
-
-def needs_scoring_weight_context(checkpoint_id: str, checkpoint_title: str) -> bool:
-    if checkpoint_id.startswith(("BD03", "BD06", "BD07", "BD09", "BD13")):
-        return True
-    return any(word in checkpoint_title for word in ["评分", "得分", "认证", "证书", "业绩", "荣誉", "软著"])
 
 
 def collect_scoring_weight_context(raw_lines: list[str], max_chars: int = 12000) -> str:
     ranges: list[tuple[int, int]] = []
     for idx, line in enumerate(raw_lines):
-        if any(phrase in line for phrase in ["评标总得分", "F1、F2", "权重(A1", "评分项"]):
-            ranges.append((max(0, idx - 6), min(len(raw_lines), idx + 36)))
-        if "权重(%)" in line or line.strip() == "权重":
+        if has_scoring_weight_structure(line):
             ranges.append((max(0, idx - 8), min(len(raw_lines), idx + 90)))
 
     merged: list[tuple[int, int]] = []
@@ -512,19 +330,16 @@ def collect_candidate_windows(
                 words.extend(group_words)
         return words
 
-    table_words = keyword_groups.get("表头词", []) + words_from_named_groups("表头", "评分")
+    table_words = keyword_groups.get("表头词", []) + words_from_named_groups("表头")
     object_words = (
         keyword_groups.get("对象词", [])
-        + words_from_named_groups("对象", "方案", "演示", "样品", "比较", "人员", "证书", "产品", "参数")
+        + words_from_named_groups("对象")
     )
     limit_words = keyword_groups.get("限制词", []) + words_from_named_groups("限制")
     consequence_words = (
         keyword_groups.get("后果词", [])
-        + words_from_named_groups("后果", "评分", "分档", "缺失信号")
-        + ["得分", "加分", "满分", "不得分", "扣分", "评分", "评审"]
+        + words_from_named_groups("后果")
     )
-    required_groups = checkpoint_required_pattern_groups(checkpoint_id, checkpoint_title)
-
     scored: list[tuple[int, int, int, dict[str, list[str]]]] = []
     for idx, line in enumerate(raw_lines):
         hits = {group: line_has_any(line, words) for group, words in keyword_groups.items()}
@@ -532,12 +347,6 @@ def collect_candidate_windows(
         if total_hits == 0:
             continue
         stats["raw_hit_count"] += 1
-        if not line_matches_required_groups(line, required_groups):
-            continue
-        if checkpoint_id == "BD11-002" and is_response_format_line(line):
-            continue
-        if checkpoint_id == "BD13-002" and is_static_warning_line(line):
-            continue
 
         has_table = bool(line_has_any(line, table_words))
         has_object = bool(line_has_any(line, object_words))
@@ -545,30 +354,14 @@ def collect_candidate_windows(
         has_consequence = bool(line_has_any(line, consequence_words))
 
         score = total_hits
-        line_has_score_signal = bool(re.search(r"(得|加|扣)?\d+(\.\d+)?\s*分|得分|加分|满分|不得分|扣分|评分|评审", line))
         if has_object and has_consequence:
             score += 8
         if has_table and has_object and has_consequence:
             score += 10
         if has_object and has_limit and has_consequence:
             score += 10
-        if has_object and ("资格" in line or "符合性" in line or "实质性" in line):
-            score += 6
-        if has_object and line_has_score_signal:
-            score += 8
-        if has_consequence and line_has_score_signal:
-            score += 4
-        if has_table and line_has_score_signal:
-            score += 4
         if not has_object and total_hits:
             score -= 1
-
-        if checkpoint_id == "BD11-003" and "修改" in line and not any(word in line for word in ["澄清", "更正", "答疑", "补遗", "顺延", "延期"]):
-            score -= 10
-        if checkpoint_id == "BD11-003" and any(word in line for word in ["开标后", "评审过程中", "评审委员会"]) and not any(word in line for word in ["招标文件的澄清", "招标文件的修改", "更正公告", "投标截止"]):
-            score -= 10
-        if checkpoint_id == "BD13-002" and is_response_format_line(line) and not any(word in line for word in ["高分", "不得分", "缺一", "原件备查", "查询截图"]):
-            score -= 8
         if score < min_candidate_score:
             continue
 
@@ -580,7 +373,7 @@ def collect_candidate_windows(
 
     if not scored:
         if stats["raw_hit_count"]:
-            stats["skip_reason"] = "仅命中弱关键词或被专用召回边界排除"
+            stats["skip_reason"] = "仅命中弱关键词，未达到候选窗口提交分数"
         else:
             stats["skip_reason"] = "未命中检查点关键词"
         return "", 0, stats
@@ -615,7 +408,7 @@ def collect_candidate_windows(
             if len(line) > max_line_chars:
                 line = line[:max_line_chars] + "……[本行已截断]"
             chunk_lines.append(f"{line_no:04d}: {line}")
-        if needs_scoring_weight_context(checkpoint_id, checkpoint_title):
+        if any(has_scoring_weight_structure(raw_lines[line_no - 1]) for line_no in range(start + 1, end + 1)):
             chunk_lines.append("")
             chunk_lines.append(
                 "评分折算提示：若本窗口表头包含“评分因素 / 权重(%) / 评分准则”，"
@@ -626,16 +419,15 @@ def collect_candidate_windows(
         chunks.append(
             f"[候选窗口 {idx}] score={score}; " + "；".join(hit_parts) + "\n" + "\n".join(chunk_lines)
         )
-    if needs_scoring_weight_context(checkpoint_id, checkpoint_title):
-        scoring_context = collect_scoring_weight_context(raw_lines)
-        if scoring_context:
-            chunks.insert(
-                0,
-                "[评分折算上下文]\n"
-                "以下内容用于判断“内部满分”和“实际总分权重”的关系；"
-                "审查评分项时必须优先读取。\n"
-                + scoring_context,
-            )
+    scoring_context = collect_scoring_weight_context(raw_lines)
+    if scoring_context:
+        chunks.insert(
+            0,
+            "[评分折算上下文]\n"
+            "以下内容用于判断“内部满分”和“实际总分权重”的关系；"
+            "审查评分项时必须优先读取。\n"
+            + scoring_context,
+        )
     excerpt = "\n\n".join(chunks)
     if len(excerpt) > max_excerpt_chars:
         excerpt = excerpt[:max_excerpt_chars] + "\n\n[候选窗口已按 max-review-excerpt-chars 截断]"
@@ -815,160 +607,6 @@ def normalize_result(result: dict[str, Any], checkpoint_id: str, checkpoint_titl
     return result
 
 
-def build_fast_skip_result(checkpoint_id: str, checkpoint_title: str, reason: str) -> dict[str, Any]:
-    summary = reason or "未召回有效候选条款，按 fast-skip 判定不命中。"
-    return normalize_result(
-        {
-            "checkpoint_id": checkpoint_id,
-            "checkpoint_title": checkpoint_title,
-            "verdict": "不命中",
-            "summary": summary,
-            "execution_trace": {
-                "candidate_recall": {"status": "已执行", "summary": summary, "candidate_count": 0},
-                "context_reading": {"status": "已跳过", "summary": "无有效候选窗口，未调用小模型。"},
-                "clause_classification": {"status": "已跳过", "summary": "无候选条款。", "clause_types": []},
-                "relevance_three_questions": {"status": "已跳过", "summary": "无候选条款。"},
-                "basic_hit_abc": {"status": "已执行", "A": False, "B": False, "C": False, "summary": "无有效候选条款。"},
-                "exclusion_checks": {"status": "已执行", "triggered": ["fast-skip：无有效候选"], "not_triggered": []},
-                "core_condition_count": {"status": "已执行", "count": 0, "summary": "核心条件未成立。"},
-                "result_branch": {"status": "已执行", "branch": "不命中", "reason": summary},
-            },
-            "candidates": [],
-        },
-        checkpoint_id,
-        checkpoint_title,
-    )
-
-
-def should_two_stage_skip(recall_stats: dict[str, Any], stage1_min_score: int) -> tuple[bool, str]:
-    max_score = int(recall_stats.get("max_score") or 0)
-    filtered_hits = int(recall_stats.get("filtered_hit_count") or 0)
-    if max_score <= 0:
-        return True, str(recall_stats.get("skip_reason") or "两阶段预筛未召回有效候选。")
-    if max_score < stage1_min_score:
-        return True, f"两阶段预筛最高风险分 {max_score} 低于阈值 {stage1_min_score}，仅作弱候选记录。"
-    if filtered_hits == 0:
-        return True, "两阶段预筛无过滤后候选。"
-    return False, ""
-
-
-def stage1_threshold_for_checkpoint(args: argparse.Namespace, checkpoint_id: str) -> int:
-    domain = checkpoint_id.split("-")[0]
-    mode_thresholds = DOMAIN_STAGE1_THRESHOLDS.get(args.mode, {})
-    return int(mode_thresholds.get(domain, args.stage1_min_score))
-
-
-def apply_mode_defaults(args: argparse.Namespace) -> None:
-    defaults = MODE_DEFAULTS[args.mode]
-    for key, value in defaults.items():
-        if getattr(args, key) is None:
-            setattr(args, key, value)
-
-
-def normalize_evidence_line(line: str) -> str:
-    line = re.sub(r"^\s*\d{1,5}\s*[:：]\s*", "", line)
-    line = re.sub(r"\s+", " ", line.strip())
-    return line
-
-
-def compact_for_match(text: str) -> str:
-    return re.sub(r"\s+", "", text)
-
-
-def extract_evidence_lines(excerpt: str) -> list[str]:
-    lines: list[str] = []
-    for line in source_lines(excerpt):
-        normalized = normalize_evidence_line(line)
-        if not normalized:
-            continue
-        if re.fullmatch(r"\d+", normalized):
-            continue
-        if len(normalized) <= 2:
-            continue
-        if normalized in {"```", "```text", "证据摘录："}:
-            continue
-        if normalized.startswith("……") or normalized.startswith("["):
-            continue
-        lines.append(normalized)
-    return lines
-
-
-def find_line_anchor_from_excerpt(excerpt: str, review_text: str) -> str | None:
-    numbered = []
-    for line in source_lines(excerpt):
-        match = re.match(r"^\s*(\d{1,5})\s*[:：]", line)
-        if match:
-            numbered.append(int(match.group(1)))
-    if numbered:
-        return f"{min(numbered):04d}-{max(numbered):04d}"
-
-    evidence_lines = extract_evidence_lines(excerpt)
-    if len(evidence_lines) == 1 and len(evidence_lines[0]) > 80:
-        fragments = [
-            normalize_evidence_line(fragment)
-            for fragment in re.split(r"[；;。]", evidence_lines[0])
-        ]
-        evidence_lines = [fragment for fragment in fragments if len(fragment) > 8 and not re.fullmatch(r"\d+", fragment)]
-    evidence_lines = evidence_lines[:8]
-    if not evidence_lines:
-        return None
-
-    raw_lines = [normalize_evidence_line(line) for line in source_lines(review_text)]
-    best: tuple[int, int, int] | None = None
-    for start_idx, raw_line in enumerate(raw_lines):
-        if not raw_line:
-            continue
-        evidence_idx = 0
-        matched: list[int] = []
-        for raw_idx in range(start_idx, len(raw_lines)):
-            if evidence_idx >= len(evidence_lines):
-                break
-            current_raw = raw_lines[raw_idx]
-            current_evidence = evidence_lines[evidence_idx]
-            if not current_raw:
-                continue
-            raw_compact = compact_for_match(current_raw)
-            evidence_compact = compact_for_match(current_evidence)
-            raw_in_evidence = len(current_raw) > 8 and current_raw in current_evidence
-            compact_match = (
-                raw_compact == evidence_compact
-                or evidence_compact in raw_compact
-                or (len(raw_compact) > 8 and raw_compact in evidence_compact)
-            )
-            if current_raw == current_evidence or current_evidence in current_raw or raw_in_evidence or compact_match:
-                matched.append(raw_idx + 1)
-                evidence_idx += 1
-        if not matched:
-            continue
-        score = len(matched)
-        span = matched[-1] - matched[0]
-        if best is None or score > best[0] or (score == best[0] and span < best[2] - best[1]):
-            best = (score, matched[0], matched[-1])
-        if score == len(evidence_lines):
-            break
-
-    if best and best[0] >= 2:
-        return f"{best[1]:04d}-{best[2]:04d}"
-    return None
-
-
-def repair_candidate_line_anchors(result: dict[str, Any], review_text: str) -> None:
-    candidates = result.get("candidates")
-    if not isinstance(candidates, list):
-        return
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-        excerpt = str(candidate.get("excerpt", "")).strip()
-        repaired = find_line_anchor_from_excerpt(excerpt, review_text)
-        if not repaired:
-            continue
-        original = str(candidate.get("line_anchor", "")).strip()
-        if original and original != repaired:
-            candidate["original_line_anchor"] = original
-        candidate["line_anchor"] = repaired
-
-
 def trace_step_summary(key: str, step: dict[str, Any]) -> str:
     summary = str(step.get("summary", "")).strip()
     if summary:
@@ -1010,7 +648,7 @@ def markdown_report(report: dict[str, Any]) -> str:
         f"- 结束时间：{report['ended_at']}",
         f"- 模型：{report['model']}",
         f"- 检查点：{report['checkpoint_path']}",
-        f"- 待审文件：{report['review_file']}",
+        f"- 待审文件：{display_file_name(report.get('review_file', ''))}",
         f"- 文本抽取方式：{report['text_extractor']}",
         "",
         "## 结论",
@@ -1072,7 +710,7 @@ def summary_markdown(report: dict[str, Any]) -> str:
             f"# {report['checkpoint_id']} 验证摘要",
             "",
             f"- 检查点：{report['checkpoint_title']}",
-            f"- 待审文件：{report['review_file']}",
+            f"- 待审文件：{display_file_name(report.get('review_file', ''))}",
             f"- 结果：{result.get('verdict', '待人工复核')}",
             f"- 摘要：{result.get('summary', '')}",
             f"- 开始时间：{report['started_at']}",
@@ -1160,6 +798,7 @@ def batch_audit_report_markdown(run_dir: Path, results: list[dict[str, Any]]) ->
     clean_items = [item for item in results if item.get("model_result", {}).get("verdict") == "不命中"]
 
     title_review_file = Path(review_files[0]).name if review_files else "未知待审文件"
+    review_file_display = display_file_name(review_files[0]) if review_files else ""
     lines = [
         "---",
         f"title: {title_review_file} 小模型检查点审查报告",
@@ -1172,7 +811,7 @@ def batch_audit_report_markdown(run_dir: Path, results: list[dict[str, Any]]) ->
         "",
         "## 运行信息",
         f"- 批次目录：{relative_path(run_dir)}",
-        f"- 待审文件：{review_files[0] if review_files else ''}",
+        f"- 待审文件：{review_file_display}",
         f"- 模型：{', '.join(models)}",
         f"- 开始时间：{min(started_values) if started_values else ''}",
         f"- 结束时间：{max(ended_values) if ended_values else ''}",
@@ -1329,15 +968,6 @@ def normalize_excerpt_key(excerpt: str) -> str:
     return text[:160]
 
 
-def evidence_group_key(candidate: dict[str, Any]) -> str:
-    start, end = parse_line_anchor(str(candidate.get("line_anchor", "")))
-    if start is not None and end is not None:
-        # 适度按行号分桶，避免同一长条款在不同 BD 中因行号略有差异而重复。
-        return f"line:{start // 5}-{end // 5}"
-    excerpt_key = normalize_excerpt_key(str(candidate.get("excerpt", "")))
-    return f"excerpt:{excerpt_key}" if excerpt_key else "unknown"
-
-
 def risk_level_for_verdict(verdict: str) -> str:
     if verdict == "命中":
         return "高"
@@ -1479,10 +1109,8 @@ def context_text_for_candidate(candidate: dict[str, Any], review_lines: list[str
     return "\n".join(review_lines[lookback_start - 1 : lookahead_end])
 
 
-def should_suppress_business_candidate(checkpoint_id: str, candidate: dict[str, Any], reason: str) -> bool:
+def should_suppress_business_candidate(candidate: dict[str, Any], reason: str) -> bool:
     """业务报告只展示有可比证据的风险，不把缺少外部资料本身包装成问题。"""
-    if checkpoint_id != "BD11-001":
-        return False
     text = "\n".join([str(candidate.get("excerpt", "")), reason])
     missing_comparator = any(
         phrase in text
@@ -1497,6 +1125,17 @@ def should_suppress_business_candidate(checkpoint_id: str, candidate: dict[str, 
     )
     only_reference = any(phrase in text for phrase in ["详见公告", "详见招标公告", "引用公告", "按本招标文件第一册第一章招标公告"])
     return missing_comparator or only_reference
+
+
+def is_supporting_evidence_only(candidate: dict[str, Any], reason: str) -> bool:
+    text = "\n".join([str(candidate.get("excerpt", "")), reason])
+    return any(phrase in text for phrase in ["综合佐证", "辅助佐证", "线索佐证", "不宜单独认定", "不单独认定"])
+
+
+def effective_business_verdict(verdict: str, candidate_verdict: str, candidate: dict[str, Any], reason: str) -> str:
+    if is_supporting_evidence_only(candidate, reason):
+        return "待人工复核"
+    return verdict
 
 
 def common_clause_context_for_candidate(candidate: dict[str, Any], review_lines: list[str]) -> dict[str, Any]:
@@ -1549,19 +1188,21 @@ def build_business_issues(results: list[dict[str, Any]], review_lines: list[str]
             start, end = parse_line_anchor(str(candidate.get("line_anchor", "")))
             reason = normalize_score_risk_language(candidate_summary(candidate))
             checkpoint_id = str(item.get("checkpoint_id", ""))
-            if should_suppress_business_candidate(checkpoint_id, candidate, reason):
+            if should_suppress_business_candidate(candidate, reason):
                 continue
             template_context = template_context_for_candidate(candidate, review_lines)
             common_clause_context = common_clause_context_for_candidate(candidate, review_lines)
+            raw_candidate_verdict = str(candidate.get("candidate_verdict", ""))
+            base_effective_verdict = effective_business_verdict(verdict, raw_candidate_verdict, candidate, reason)
             effective_verdict = (
                 "待人工复核"
                 if template_context.get("is_template_blank") or common_clause_context.get("is_common_generic_standard")
-                else verdict
+                else base_effective_verdict
             )
             effective_candidate_verdict = (
                 "待人工复核"
                 if template_context.get("is_template_blank") or common_clause_context.get("is_common_generic_standard")
-                else str(candidate.get("candidate_verdict", ""))
+                else effective_business_verdict(raw_candidate_verdict, raw_candidate_verdict, candidate, reason)
             )
             if template_context.get("note"):
                 reason = (
@@ -1773,7 +1414,7 @@ def business_audit_report_data(run_dir: Path, results: list[dict[str, Any]]) -> 
 
 
 def business_audit_report_markdown(data: dict[str, Any]) -> str:
-    review_file_name = Path(str(data.get("review_file", ""))).name or "未知待审文件"
+    review_file_name = display_file_name(data.get("review_file", "")) or "未知待审文件"
     issues = data.get("issues", [])
     hit_issues = [issue for issue in issues if issue.get("verdict") == "命中"]
     review_issues = [issue for issue in issues if issue.get("verdict") == "待人工复核"]
@@ -1794,7 +1435,7 @@ def business_audit_report_markdown(data: dict[str, Any]) -> str:
         "",
         f"- 审查方式：AI 自动审查",
         f"- 审查模型：{', '.join(data.get('models', []))}",
-        f"- 待审文件：{data.get('review_file', '')}",
+        f"- 待审文件：{review_file_name}",
         f"- 开始时间：{data.get('started_at', '')}",
         f"- 结束时间：{data.get('ended_at', '')}",
         f"- 检查点数量：{data.get('checkpoint_count', 0)}",
@@ -1948,22 +1589,16 @@ def expand_checkpoint_glob(pattern: str) -> list[Path]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="验证 1 个 BD 检查点执行说明书是否能约束小模型审查 1 份待审文件。"
+        description="按 BD 检查点 SOP 调用小模型审查 1 份待审文件。"
     )
     parser.add_argument("--checkpoint", type=Path, help="BD 检查点 md 文件路径")
     parser.add_argument("--checkpoint-glob", help="批量验证检查点 glob，例如 'wiki/checkpoints/BD06-*.md'")
     parser.add_argument("--review-file", type=Path, help="待审文件，支持 md/txt/doc/docx")
     parser.add_argument("--aggregate-run-dir", type=Path, help="汇总批次目录下的 result.json，生成审查报告.md")
     parser.add_argument("--output-dir", type=Path, help="输出目录，默认 validation/cli-runs/checkpoint-...")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="OpenAI 兼容接口 base_url")
-    parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="OpenAI 兼容接口密钥")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="模型名称")
-    parser.add_argument(
-        "--mode",
-        choices=sorted(MODE_DEFAULTS),
-        default="standard",
-        help="运行模式：quick 快速初筛；standard 默认业务审查；strict 稳健复核；sop-validation SOP 验证",
-    )
+    parser.add_argument("--base-url", help=f"OpenAI 兼容接口 base_url；也可用环境变量 {ENV_BASE_URL}")
+    parser.add_argument("--api-key", help=f"OpenAI 兼容接口密钥；也可用环境变量 {ENV_API_KEY}")
+    parser.add_argument("--model", help=f"模型名称；也可用环境变量 {ENV_MODEL}")
     parser.add_argument("--timeout", type=int, default=1800, help="接口超时秒数")
     parser.add_argument("--temperature", type=float, default=0.0, help="模型温度")
     parser.add_argument("--context-before", type=int, default=5, help="候选命中行前文行数")
@@ -1972,14 +1607,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-line-chars", type=int, default=900, help="候选窗口中单行最大字符数")
     parser.add_argument("--max-review-excerpt-chars", type=int, default=12000, help="候选窗口总字符上限")
     parser.add_argument("--max-checkpoint-chars", type=int, default=18000, help="检查点执行说明书字符上限")
-    parser.add_argument("--max-tokens", type=int, default=None, help="模型最大输出 token；默认由 --mode 决定")
-    parser.add_argument("--min-candidate-score", type=int, default=3, help="低于该分数的弱候选不送入模型")
-    parser.add_argument("--two-stage", action=argparse.BooleanOptionalAction, default=None, help="先用召回分数轻量预筛，疑似风险再调用模型生成完整报告；默认由 --mode 决定")
-    parser.add_argument("--stage1-min-score", type=int, default=None, help="两阶段预筛进入模型审查的最低最高候选分；默认由 --mode 和 BD 域决定")
-    parser.add_argument("--jobs", type=int, default=None, help="批量验证并发数；默认由 --mode 决定")
-    parser.add_argument("--fast-skip", action=argparse.BooleanOptionalAction, default=None, help="无有效候选窗口时跳过模型调用并直接输出不命中；默认由 --mode 决定")
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="模型最大输出 token")
+    parser.add_argument("--min-candidate-score", type=int, default=DEFAULT_MIN_CANDIDATE_SCORE, help="低于该分数的弱候选不送入模型")
+    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help="批量验证并发数")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True, help="批量验证时跳过已有 result.json 的检查点")
-    parser.add_argument("--repair-line-anchors", action=argparse.BooleanOptionalAction, default=False, help="是否用原文二次修复模型证据行号；默认关闭以提升性能")
     parser.add_argument("--reuse-raw-response", action=argparse.BooleanOptionalAction, default=True, help="续跑时复用已存在的 raw-response.json，避免重复请求模型")
     return parser
 
@@ -2041,77 +1672,20 @@ def run_single_validation(
             flush=True,
         )
 
-        if args.fast_skip and window_count == 0:
-            ended_at = now_text()
-            model_result = build_fast_skip_result(checkpoint_id, checkpoint_title, str(recall_stats.get("skip_reason", "")))
-            report_file = output_dir / f"{checkpoint_id}-{slugify_filename(checkpoint_title)}.md"
-            report = {
-                "started_at": started_at,
-                "ended_at": ended_at,
-                "model": "fast-skip",
-                "checkpoint_id": checkpoint_id,
-                "checkpoint_title": checkpoint_title,
-                "checkpoint_path": relative_path(checkpoint_path),
-                "review_file": relative_path(review_file),
-                "text_extractor": extractor,
-                "candidate_window_count": window_count,
-                "recall_stats": recall_stats,
-                "prompt_file": relative_path(prompt_file),
-                "report_file": relative_path(report_file),
-                "raw_response_file": "",
-                "model_result": model_result,
-            }
-            write_text(report_file, markdown_report(report))
-            write_text(output_dir / "summary.md", summary_markdown(report))
-            write_text(output_dir / "result.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-            print(f"skip {ended_at} verdict=不命中 reason={recall_stats.get('skip_reason', '')} output={relative_path(report_file)}", flush=True)
-            return 0
-
-        if args.two_stage:
-            stage1_min_score = stage1_threshold_for_checkpoint(args, checkpoint_id)
-            recall_stats["stage1_min_score"] = stage1_min_score
-            recall_stats["mode"] = args.mode
-            skip_by_stage, stage_reason = should_two_stage_skip(recall_stats, stage1_min_score)
-            if skip_by_stage:
-                ended_at = now_text()
-                recall_stats["skip_reason"] = stage_reason
-                recall_stats["two_stage_skipped"] = True
-                model_result = build_fast_skip_result(checkpoint_id, checkpoint_title, stage_reason)
-                report_file = output_dir / f"{checkpoint_id}-{slugify_filename(checkpoint_title)}.md"
-                report = {
-                    "started_at": started_at,
-                    "ended_at": ended_at,
-                    "model": "two-stage-fast-skip",
-                    "checkpoint_id": checkpoint_id,
-                    "checkpoint_title": checkpoint_title,
-                    "checkpoint_path": relative_path(checkpoint_path),
-                    "review_file": relative_path(review_file),
-                    "text_extractor": extractor,
-                    "candidate_window_count": window_count,
-                    "recall_stats": recall_stats,
-                    "prompt_file": relative_path(prompt_file),
-                    "report_file": relative_path(report_file),
-                    "raw_response_file": "",
-                    "model_result": model_result,
-                }
-                write_text(report_file, markdown_report(report))
-                write_text(output_dir / "summary.md", summary_markdown(report))
-                write_text(output_dir / "result.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-                print(f"stage-skip {ended_at} verdict=不命中 reason={stage_reason} output={relative_path(report_file)}", flush=True)
-                return 0
-
         messages = build_messages(
             checkpoint_id,
             checkpoint_title,
             compact_text,
             review_file.name,
-            review_excerpt,
+            review_excerpt or "无有效候选窗口。",
         )
         raw_response_file = output_dir / "raw-response.json"
         if args.reuse_raw_response and raw_response_file.exists():
             response = json.loads(read_text(raw_response_file))
+            model_name = str(response.get("model") or args.model or os.environ.get(ENV_MODEL) or "raw-response")
             print(f"reuse raw-response {relative_path(raw_response_file)}", flush=True)
         else:
+            resolve_llm_config(args)
             response = post_openai_compatible(
                 args.base_url,
                 args.api_key,
@@ -2121,17 +1695,16 @@ def run_single_validation(
                 args.timeout,
                 args.max_tokens,
             )
+            model_name = str(args.model)
             write_text(raw_response_file, json.dumps(response, ensure_ascii=False, indent=2) + "\n")
         model_result = normalize_result(parse_model_json(response), checkpoint_id, checkpoint_title)
-        if args.repair_line_anchors:
-            repair_candidate_line_anchors(model_result, review_text)
         ended_at = now_text()
 
         report_file = output_dir / f"{checkpoint_id}-{slugify_filename(checkpoint_title)}.md"
         report: dict[str, Any] = {
             "started_at": started_at,
             "ended_at": ended_at,
-            "model": args.model,
+            "model": model_name,
             "checkpoint_id": checkpoint_id,
             "checkpoint_title": checkpoint_title,
             "checkpoint_path": relative_path(checkpoint_path),
@@ -2179,11 +1752,8 @@ def run_batch_validation(args: argparse.Namespace) -> int:
         f"batch_dir={relative_path(batch_dir)}\n"
         f"review_file={relative_path(review_file)}\n"
         f"checkpoint_count={len(checkpoint_paths)}\n"
-        f"mode={args.mode}\n"
-        + f"jobs={args.jobs}\n"
+        f"jobs={args.jobs}\n"
         + f"max_tokens={args.max_tokens}\n"
-        + f"fast_skip={args.fast_skip}\n"
-        + f"two_stage={args.two_stage}\n",
     )
     failures = 0
     jobs = max(1, int(args.jobs or 1))
@@ -2246,7 +1816,6 @@ def run_batch_validation(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = build_arg_parser().parse_args()
-    apply_mode_defaults(args)
     if args.aggregate_run_dir:
         run_dir = args.aggregate_run_dir.resolve()
         report_file, data_file = write_batch_audit_report(run_dir)
