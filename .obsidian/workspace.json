@@ -1,0 +1,223 @@
+{
+  "main": {
+    "id": "37abeccfad0ce5ed",
+    "type": "split",
+    "children": [
+      {
+        "id": "9729750e0ce4d058",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "f22d017fc448f875",
+            "type": "leaf",
+            "state": {
+              "type": "empty",
+              "state": {},
+              "icon": "lucide-file",
+              "title": "新标签页"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "31778aa555b3c4e3",
+    "type": "split",
+    "children": [
+      {
+        "id": "f9d8d0b962a27f12",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "095cb17c2a22c1ad",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "文件列表"
+            }
+          },
+          {
+            "id": "d8349133bfb06f1d",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "搜索"
+            }
+          },
+          {
+            "id": "4a3054193dcdddf3",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "书签"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "4af3a9e8720ca5e9",
+    "type": "split",
+    "children": [
+      {
+        "id": "ec4189265f729a34",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "d00c5eae3d63cdf2",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "INGEST.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "INGEST 的反向链接列表"
+            }
+          },
+          {
+            "id": "aae37d707d1cd53a",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "INGEST.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "INGEST 的出链列表"
+            }
+          },
+          {
+            "id": "33b3f56c638f6a13",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "标签"
+            }
+          },
+          {
+            "id": "93f9ff6e6b2c6f01",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "添加笔记属性"
+            }
+          },
+          {
+            "id": "8d0b35177a4c4de2",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "INGEST.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "INGEST 的大纲"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:打开快速切换": false,
+      "graph:查看关系图谱": false,
+      "canvas:新建白板": false,
+      "daily-notes:打开/创建今天的日记": false,
+      "templates:插入模板": false,
+      "command-palette:打开命令面板": false,
+      "bases:新建数据库": false
+    }
+  },
+  "active": "095cb17c2a22c1ad",
+  "lastOpenFiles": [
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD09-001/prompt.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD09-001",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-002/result.json",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-002/summary.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-002/BD07-002-方案类评分仅用优良中差等主观分档.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-002/raw-response.json",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-009/prompt.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-009",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD06-001/result.json",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD06-001/summary.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD06-001/BD06-001-评审因素与采购需求不对应.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD06-001/raw-response.json",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-008/prompt.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-008",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-003/result.json",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-003/summary.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-003/BD07-003-实施方案、服务方案、管理方案缺少可判定分档.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-003/raw-response.json",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-007/prompt.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-007",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD05-002/summary.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD05-002/BD05-002-技术参数组合指向特定产品.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-006/prompt.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-001/summary.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-001/BD08-001-非法定条件作为资格条件.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-005/prompt.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD06-002/summary.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD06-002/BD06-002-证书、资质、认证与采购标的不相关.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-004/prompt.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-001/summary.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-001/BD07-001-评审因素未细化量化.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-003/prompt.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-005/summary.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD07-005/BD07-005-样品评分缺少明确客观标准.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD08-002/prompt.md",
+    "validation/cli-runs/quick-SZDL2025000495-diesel-generator-rerun-20260426/BD06-007/summary.md",
+    "未命名.canvas",
+    "未命名 1.canvas"
+  ]
+}

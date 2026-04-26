@@ -1,0 +1,4 @@
+tests/
+validation/
+.DS_Store
+.pytest_cache/

@@ -1,0 +1,33 @@
+# 社会治理服务-光明区司法局纠纷调解领域购买社会工作服务项目（司法领域专职社工服务）-docx版
+
+- source_file: raw/source-files/深圳10个品目批注文件/社会治理服务/光明区司法局纠纷调解领域购买社会工作服务项目（司法领域专职社工服务）.docx
+- item_type: 社会治理服务
+- project_page: [[projects/光明区司法局纠纷调解领域购买社会工作服务项目（司法领域专职社工服务）|光明区司法局纠纷调解领域购买社会工作服务项目（司法领域专职社工服务）]]
+- full_risk_scan: [[raw/full-risk-scans/社会治理服务-光明区司法局纠纷调解领域购买社会工作服务项目（司法领域专职社工服务）-docx版|scan]]
+- numbered_text: [[raw/numbered-text/社会治理服务-光明区司法局纠纷调解领域购买社会工作服务项目（司法领域专职社工服务）-docx版|numbered]]
+- review_basis: 无批注或批注不可抽取文件，已先做单文件全风险点扫描
+- project_code: unknown
+- procurement_type: 服务
+- has_comments: no
+- comment_count: 0
+- risk_count: 12
+- priority: P1
+- evidence_status: numbered-text + full-risk-scan
+- scan_status: reviewed
+
+## top_findings
+- 评分项未细化量化
+- 证书设置与项目相关性不足
+- 特定组织形态或评级要求可能构成差别待遇
+- 服务采购不宜按买人或无关资历堆砌逻辑组织评分
+- 固定月份社保作为评分条件
+- 自有员工或社保绑定评分条件
+- 荣誉或评级级别要求过高且口径不清
+- 评标方法模板切换不完整
+
+## current_focus
+- 评分标准、扣分逻辑或主观分写法未形成可稳定复核的量化闭环。
+- 证书、认证、软著或奖项与采购标的质量、履约能力的关联性不足。
+- 组织形态、社会组织评级或特定主体身份要求可能形成差别待遇。
+- 服务采购评分不宜堆砌人数、学历、职称等与真实履约弱相关因素。
+- 固定月份或连续月数社保若进入评分，存在差别待遇风险。

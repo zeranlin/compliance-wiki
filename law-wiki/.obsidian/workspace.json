@@ -1,0 +1,215 @@
+{
+  "main": {
+    "id": "e42025e7b93bf3e9",
+    "type": "split",
+    "children": [
+      {
+        "id": "f163c473d758da1b",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "5ddeb6250c0082d0",
+            "type": "leaf",
+            "state": {
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "关系图谱"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "cec6935ebef6e1f6",
+    "type": "split",
+    "children": [
+      {
+        "id": "6d7a7806b916a210",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "b6d72162bcb2be9c",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "文件列表"
+            }
+          },
+          {
+            "id": "eea6666f92d341b5",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "搜索"
+            }
+          },
+          {
+            "id": "953684bcaed32937",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "书签"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "a8e1e49612dc4f12",
+    "type": "split",
+    "children": [
+      {
+        "id": "ed88a9f3d2ed4216",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "333b773b277728bc",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "反向链接"
+            }
+          },
+          {
+            "id": "e212424845794321",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "出链"
+            }
+          },
+          {
+            "id": "cb4f715c537fed28",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "标签"
+            }
+          },
+          {
+            "id": "c6b6793fa06919fa",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "添加笔记属性"
+            }
+          },
+          {
+            "id": "81874ba8b57b7e44",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "大纲"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:打开快速切换": false,
+      "graph:查看关系图谱": false,
+      "canvas:新建白板": false,
+      "daily-notes:打开/创建今天的日记": false,
+      "templates:插入模板": false,
+      "command-palette:打开命令面板": false,
+      "bases:新建数据库": false
+    }
+  },
+  "active": "5ddeb6250c0082d0",
+  "lastOpenFiles": [
+    "audits/local-materials-inventory.md",
+    "biz-materials/采购文件歧视条款检查点.md",
+    "biz-materials/四川2023年政府采购文件典型问题清单.md",
+    "biz-materials",
+    "raw/biz-extracted/采购文件歧视条款检查点.md",
+    "raw/biz-extracted/四川2023年关于政府采购文件典型问题预计处理0828.md",
+    "raw/biz-extracted",
+    "raw/sources/政府采购非招标采购方式管理办法-docx全文.txt",
+    "raw/sources/政府采购质疑和投诉办法-docx全文.txt",
+    "raw/sources/政府采购货物和服务招标投标管理办法-docx全文.txt",
+    "raw/sources/政府采购框架协议采购方式管理暂行办法-docx全文.txt",
+    "raw/sources/政府采购信息发布管理办法-docx全文.txt",
+    "raw/sources/中华人民共和国政府采购法实施条例-docx全文.txt",
+    "raw/sources/中华人民共和国政府采购法-docx全文.txt",
+    "raw/laws/政府采购非招标采购方式管理办法.docx",
+    "topics/四类违法违规专项整治.md",
+    "topics/中小企业政府采购政策.md",
+    "topics/公平竞争与营商环境.md",
+    "topics/采购需求管理.md",
+    "sources/2025年政府采购领域四类违法违规行为专项整治工作通知.md",
+    "sources/2023年政府采购领域四类违法违规行为专项整治工作通知.md",
+    "sources/政府采购促进中小企业发展管理办法.md",
+    "sources/财政部关于促进政府采购公平竞争优化营商环境的通知.md",
+    "sources/政府采购需求管理办法.md",
+    "LINT.md",
+    "QUERY.md",
+    "INGEST.md",
+    "AGENTS.md",
+    "raw/sources/政府采购需求管理办法-财库2021-22.md",
+    "raw/sources/政府采购促进中小企业发展管理办法-财库2020-46.md",
+    "raw/sources/促进政府采购公平竞争优化营商环境通知-财库2019-38-地方政府转载.md",
+    "raw/sources/2025年政府采购领域四类违法违规行为专项整治-财库2025-14.md",
+    "raw/sources/2023年政府采购领域四类违法违规行为专项整治-财库2023-28.md"
+  ]
+}
