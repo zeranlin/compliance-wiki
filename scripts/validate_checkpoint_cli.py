@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import difflib
 import glob
 import json
 import os
@@ -21,6 +22,11 @@ DEFAULT_OUTPUT_ROOT = WORKSPACE_ROOT / "validation" / "cli-runs"
 DEFAULT_JOBS = 8
 DEFAULT_MAX_TOKENS = 6144
 DEFAULT_MIN_CANDIDATE_SCORE = 3
+DEFAULT_CANDIDATE_POOL_FACTOR = 4
+DEFAULT_WINDOW_DEDUPE_THRESHOLD = 0.92
+DEFAULT_WINDOW_MERGE_GAP = 2
+DEFAULT_SHORT_LINE_LOOKAHEAD = 5
+DEFAULT_SUPPORT_CONTEXT_WINDOWS = 2
 ENV_BASE_URL = "CHECKPOINT_LLM_BASE_URL"
 ENV_MODEL = "CHECKPOINT_LLM_MODEL"
 ENV_API_KEY = "CHECKPOINT_LLM_API_KEY"
@@ -112,6 +118,93 @@ def extract_text_from_docx(path: Path) -> tuple[str, str]:
     raise RuntimeError(f"无法提取 {path.name}，docx 内容为空")
 
 
+def normalize_extracted_text(text: str) -> str:
+    return (
+        text.replace("\r", "")
+        .replace("\x0b", "\n")
+        .replace("\x0c", "\n")
+        .replace("\u2028", "\n")
+        .replace("\u2029", "\n")
+    )
+
+
+def extract_structured_review_from_docx(path: Path) -> dict[str, Any]:
+    try:
+        import docx  # type: ignore
+        from docx.document import Document as _Document  # type: ignore
+        from docx.oxml.table import CT_Tbl  # type: ignore
+        from docx.oxml.text.paragraph import CT_P  # type: ignore
+        from docx.table import Table  # type: ignore
+        from docx.text.paragraph import Paragraph  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(f"无法结构化提取 {path.name}，python-docx 不可用") from exc
+
+    def iter_block_items(parent: _Document):
+        for child in parent.element.body.iterchildren():
+            if isinstance(child, CT_P):
+                yield Paragraph(child, parent)
+            elif isinstance(child, CT_Tbl):
+                yield Table(child, parent)
+
+    def paragraph_to_text(item: Any) -> str:
+        return normalize_extracted_text(str(item.text or "")).strip()
+
+    def table_to_text(item: Any) -> str:
+        rows: list[str] = []
+        for row in item.rows:
+            cells = [normalize_extracted_text(str(cell.text or "")).strip() for cell in row.cells]
+            if any(cells):
+                rows.append("\t".join(cells))
+        return "\n".join(rows).strip()
+
+    document = docx.Document(str(path))
+    blocks: list[dict[str, Any]] = []
+    all_lines: list[str] = []
+    stats = {"paragraph_blocks": 0, "table_blocks": 0, "block_count": 0, "line_count": 0}
+    line_no = 1
+    block_index = 1
+    for item in iter_block_items(document):
+        block_type = "paragraph"
+        if item.__class__.__name__ == "Paragraph":
+            text = paragraph_to_text(item)
+            if text:
+                stats["paragraph_blocks"] += 1
+        else:
+            block_type = "table"
+            text = table_to_text(item)
+            if text:
+                stats["table_blocks"] += 1
+        if text:
+            block_lines = text.split("\n")
+            start_line = line_no
+            for block_line in block_lines:
+                all_lines.append(block_line)
+                line_no += 1
+            blocks.append(
+                {
+                    "block_id": f"b{block_index:04d}",
+                    "block_type": block_type,
+                    "order_index": block_index,
+                    "text": text,
+                    "lines": block_lines,
+                    "line_start": start_line,
+                    "line_end": line_no - 1,
+                }
+            )
+            block_index += 1
+    stats["block_count"] = len(blocks)
+    stats["line_count"] = len(all_lines)
+    text = "\n".join(all_lines).strip()
+    if not text:
+        raise RuntimeError(f"无法结构化提取 {path.name}，docx 内容为空")
+    return {
+        "text": text,
+        "extractor": "python-docx-structured-lines",
+        "stats": stats,
+        "lines": all_lines,
+    }
+
+
 def extract_text_from_doc(path: Path) -> tuple[str, str]:
     antiword = subprocess.run(
         ["antiword", str(path)],
@@ -135,6 +228,35 @@ def extract_text_from_doc(path: Path) -> tuple[str, str]:
     raise RuntimeError(f"无法提取 {path.name}：{error_text}")
 
 
+def extract_text_from_pdf(path: Path) -> tuple[str, str]:
+    pdftotext = subprocess.run(
+        ["pdftotext", "-layout", str(path), "-"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if pdftotext.returncode == 0 and pdftotext.stdout.strip():
+        return pdftotext.stdout, "pdftotext-layout"
+
+    try:
+        import pypdf  # type: ignore
+    except ImportError as exc:
+        error_text = pdftotext.stderr.strip() or "pdftotext 无输出且 pypdf 不可用"
+        raise RuntimeError(f"无法提取 {path.name}：{error_text}") from exc
+
+    reader = pypdf.PdfReader(str(path))
+    pages: list[str] = []
+    for page_index, page in enumerate(reader.pages, start=1):
+        text = normalize_extracted_text(page.extract_text() or "").strip()
+        if text:
+            pages.append(f"[第 {page_index} 页]\n{text}")
+    output = "\n\n".join(pages).strip()
+    if output:
+        return output, "pypdf"
+    error_text = pdftotext.stderr.strip() or "PDF 内容为空或无法抽取文本"
+    raise RuntimeError(f"无法提取 {path.name}：{error_text}")
+
+
 def load_review_file(path: Path) -> tuple[str, str]:
     suffix = path.suffix.lower()
     if suffix in {".md", ".txt"}:
@@ -143,7 +265,28 @@ def load_review_file(path: Path) -> tuple[str, str]:
         return extract_text_from_docx(path)
     if suffix == ".doc":
         return extract_text_from_doc(path)
+    if suffix == ".pdf":
+        return extract_text_from_pdf(path)
     raise RuntimeError(f"暂不支持的待审文件类型：{path.suffix}")
+
+
+def load_review_file_variants(path: Path) -> dict[str, Any]:
+    plain_text, plain_extractor = load_review_file(path)
+    variants: dict[str, Any] = {
+        "plain_text": plain_text,
+        "plain_extractor": plain_extractor,
+    }
+    if path.suffix.lower() == ".docx":
+        try:
+            structured_review = extract_structured_review_from_docx(path)
+        except Exception as exc:
+            variants["structured_error"] = str(exc)
+        else:
+            variants["structured_text"] = structured_review["text"]
+            variants["structured_extractor"] = structured_review["extractor"]
+            variants["structured_stats"] = structured_review["stats"]
+            variants["structured_lines"] = structured_review["lines"]
+    return variants
 
 
 def parse_frontmatter(markdown: str) -> dict[str, Any]:
@@ -201,9 +344,12 @@ def extract_section(markdown: str, heading: str) -> str:
 
 def compact_checkpoint_text(markdown: str, max_chars: int) -> str:
     headings = [
+        "审查目标",
+        "适用范围",
         "标准检查点",
         "检查点定义",
         "审查问题句",
+        "定位与召回剖面",
         "定位关键词",
         "候选召回规则",
         "上下文读取规则",
@@ -218,6 +364,12 @@ def compact_checkpoint_text(markdown: str, max_chars: int) -> str:
         "反例",
         "审查步骤",
         "结论表达",
+        "风险提示",
+        "修改建议",
+        "审查依据",
+        "示例",
+        "易误报场景",
+        "地区适用说明",
     ]
     chunks: list[str] = []
     included_headings: set[str] = set()
@@ -243,7 +395,7 @@ def compact_checkpoint_text(markdown: str, max_chars: int) -> str:
 
 
 def parse_keyword_groups(markdown: str) -> dict[str, list[str]]:
-    section = extract_section(markdown, "定位关键词")
+    section = extract_section(markdown, "定位与召回剖面") or extract_section(markdown, "定位关键词")
     groups: dict[str, list[str]] = {}
     current_group = "关键词"
     groups[current_group] = []
@@ -265,6 +417,14 @@ def line_has_any(line: str, words: list[str]) -> list[str]:
     return [word for word in words if word and word in line]
 
 
+def words_from_named_groups(keyword_groups: dict[str, list[str]], *name_parts: str) -> list[str]:
+    words: list[str] = []
+    for group_name, group_words in keyword_groups.items():
+        if any(part in group_name for part in name_parts):
+            words.extend(group_words)
+    return words
+
+
 def has_scoring_weight_structure(line: str) -> bool:
     """识别待审文件中的评分权重结构，用于补充上下文而非判断风险。"""
     compact = re.sub(r"\s+", "", line)
@@ -276,11 +436,52 @@ def has_scoring_weight_structure(line: str) -> bool:
     )
 
 
-def collect_scoring_weight_context(raw_lines: list[str], max_chars: int = 12000) -> str:
+def normalize_similarity_text(text: str) -> str:
+    compact = normalize_extracted_text(text)
+    compact = re.sub(r"[0-9０-９]+", "", compact)
+    compact = re.sub(r"[A-Za-z]+", "", compact)
+    compact = re.sub(r"[（(][一二三四五六七八九十0-9]+[）)]", "", compact)
+    compact = re.sub(r"[^\u4e00-\u9fff]+", "", compact)
+    return compact
+
+
+def merge_hit_words(
+    left: dict[str, list[str]],
+    right: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    return {
+        group: sorted(set(left.get(group, [])) | set(right.get(group, [])))
+        for group in set(left) | set(right)
+    }
+
+
+def window_signature(raw_lines: list[str], start: int, end: int) -> str:
+    return normalize_similarity_text("\n".join(raw_lines[start:end]))
+
+
+def is_similar_window(signature: str, seen_signatures: list[str], threshold: float) -> bool:
+    if not signature:
+        return False
+    return any(difflib.SequenceMatcher(None, signature, seen).ratio() >= threshold for seen in seen_signatures)
+
+
+def hit_words_by_group_name(hits: dict[str, list[str]], *name_parts: str) -> set[str]:
+    words: set[str] = set()
+    for group_name, group_words in hits.items():
+        if any(part in group_name for part in name_parts):
+            words.update(group_words)
+    return words
+
+
+def overlaps_any_window(start: int, end: int, windows: list[tuple[int, int]]) -> bool:
+    return any(start <= window_end and end >= window_start for window_start, window_end in windows)
+
+
+def collect_scoring_weight_context(raw_lines: list[str], max_chars: int = 3000) -> str:
     ranges: list[tuple[int, int]] = []
     for idx, line in enumerate(raw_lines):
         if has_scoring_weight_structure(line):
-            ranges.append((max(0, idx - 8), min(len(raw_lines), idx + 90)))
+            ranges.append((max(0, idx - 4), min(len(raw_lines), idx + 24)))
 
     merged: list[tuple[int, int]] = []
     for start, end in sorted(ranges):
@@ -290,13 +491,69 @@ def collect_scoring_weight_context(raw_lines: list[str], max_chars: int = 12000)
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
 
     lines: list[str] = []
-    for start, end in merged[:6]:
+    for start, end in merged[:4]:
         for line_no in range(start + 1, end + 1):
             lines.append(f"{line_no:04d}: {raw_lines[line_no - 1]}")
     text = "\n".join(lines)
     if len(text) > max_chars:
         text = text[:max_chars] + "\n[评分折算上下文已截断]"
     return text
+
+
+def score_keyword_hits(
+    text: str,
+    keyword_groups: dict[str, list[str]],
+) -> tuple[int, dict[str, list[str]], int]:
+    table_words = (
+        keyword_groups.get("表头词", [])
+        + words_from_named_groups(keyword_groups, "表头", "章节", "角色")
+    )
+    object_words = keyword_groups.get("对象词", []) + words_from_named_groups(keyword_groups, "对象")
+    limit_words = (
+        keyword_groups.get("限制词", [])
+        + words_from_named_groups(keyword_groups, "限制", "行为", "门槛", "模式")
+    )
+    consequence_words = keyword_groups.get("后果词", []) + words_from_named_groups(keyword_groups, "后果")
+
+    hits = {group: line_has_any(text, words) for group, words in keyword_groups.items()}
+    total_hits = sum(len(words) for words in hits.values())
+    if total_hits == 0:
+        return 0, hits, total_hits
+
+    compact_text = re.sub(r"\s+", "", text)
+    scoring_consequence_hits = []
+    if re.search(r"得\d+(?:\.\d+)?分", compact_text):
+        scoring_consequence_hits.append("得N分")
+    if re.search(r"不得分", compact_text):
+        scoring_consequence_hits.append("不得分")
+    if re.search(r"共计\d+(?:\.\d+)?分", compact_text):
+        scoring_consequence_hits.append("共计N分")
+    if re.search(r"[（(]\d+(?:\.\d+)?分[）)]", compact_text):
+        scoring_consequence_hits.append("括号分值")
+    if scoring_consequence_hits:
+        hits["评分结构词"] = scoring_consequence_hits
+
+    has_table = bool(line_has_any(text, table_words))
+    has_object = bool(line_has_any(text, object_words))
+    has_limit = bool(line_has_any(text, limit_words))
+    has_consequence = bool(line_has_any(text, consequence_words) or scoring_consequence_hits)
+
+    score = total_hits
+    if scoring_consequence_hits:
+        score += len(scoring_consequence_hits)
+    if has_object and has_limit:
+        score += 8
+    if has_object and has_consequence:
+        score += 8
+    if has_table and has_object and has_limit:
+        score += 8
+    if has_table and has_object and has_consequence:
+        score += 10
+    if has_object and has_limit and has_consequence:
+        score += 10
+    if object_words and not has_object and total_hits:
+        score -= 1
+    return score, hits, total_hits
 
 
 def collect_candidate_windows(
@@ -322,53 +579,23 @@ def collect_candidate_windows(
     if not raw_lines:
         stats["skip_reason"] = "待审文件文本为空"
         return "", 0, stats
-
-    def words_from_named_groups(*name_parts: str) -> list[str]:
-        words: list[str] = []
-        for group_name, group_words in keyword_groups.items():
-            if any(part in group_name for part in name_parts):
-                words.extend(group_words)
-        return words
-
-    table_words = keyword_groups.get("表头词", []) + words_from_named_groups("表头")
-    object_words = (
-        keyword_groups.get("对象词", [])
-        + words_from_named_groups("对象")
-    )
-    limit_words = keyword_groups.get("限制词", []) + words_from_named_groups("限制")
-    consequence_words = (
-        keyword_groups.get("后果词", [])
-        + words_from_named_groups("后果")
-    )
     scored: list[tuple[int, int, int, dict[str, list[str]]]] = []
+    weak_scored: list[tuple[int, int, int, dict[str, list[str]]]] = []
     for idx, line in enumerate(raw_lines):
-        hits = {group: line_has_any(line, words) for group, words in keyword_groups.items()}
-        total_hits = sum(len(words) for words in hits.values())
+        lookahead_end = min(len(raw_lines), idx + DEFAULT_SHORT_LINE_LOOKAHEAD + 1)
+        scoring_text = "\n".join(raw_lines[idx:lookahead_end])
+        score, hits, total_hits = score_keyword_hits(scoring_text, keyword_groups)
         if total_hits == 0:
             continue
         stats["raw_hit_count"] += 1
-
-        has_table = bool(line_has_any(line, table_words))
-        has_object = bool(line_has_any(line, object_words))
-        has_limit = bool(line_has_any(line, limit_words))
-        has_consequence = bool(line_has_any(line, consequence_words))
-
-        score = total_hits
-        if has_object and has_consequence:
-            score += 8
-        if has_table and has_object and has_consequence:
-            score += 10
-        if has_object and has_limit and has_consequence:
-            score += 10
-        if not has_object and total_hits:
-            score -= 1
-        if score < min_candidate_score:
-            continue
-
-        stats["filtered_hit_count"] += 1
         start = max(0, idx - context_before)
         end = min(len(raw_lines), idx + context_after + 1)
         start = expand_template_context_start(raw_lines, start, end)
+        if score < min_candidate_score:
+            weak_scored.append((score, start, end, hits))
+            continue
+
+        stats["filtered_hit_count"] += 1
         scored.append((score, start, end, hits))
 
     if not scored:
@@ -379,25 +606,49 @@ def collect_candidate_windows(
         return "", 0, stats
 
     scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-    selected = scored[:max_windows]
+    pool_size = max(max_windows * DEFAULT_CANDIDATE_POOL_FACTOR, max_windows)
+    candidate_pool = scored[:pool_size]
+    candidate_pool.sort(key=lambda item: item[1])
+    stats["candidate_pool_size"] = len(candidate_pool)
+
+    merged_pool: list[tuple[int, int, int, dict[str, list[str]]]] = []
+    for score, start, end, hits in candidate_pool:
+        if not merged_pool or start > merged_pool[-1][2] + DEFAULT_WINDOW_MERGE_GAP:
+            merged_pool.append((score, start, end, hits))
+            continue
+        prev_score, prev_start, prev_end, prev_hits = merged_pool[-1]
+        merged_pool[-1] = (
+            max(prev_score, score),
+            prev_start,
+            max(prev_end, end),
+            merge_hit_words(prev_hits, hits),
+        )
+
+    stats["merged_window_count"] = len(merged_pool)
+    selected: list[tuple[int, int, int, dict[str, list[str]]]] = []
+    seen_signatures: list[str] = []
+    duplicate_skipped = 0
+    for item in sorted(merged_pool, key=lambda row: (row[0], -row[1]), reverse=True):
+        _, start, end, _ = item
+        signature = window_signature(raw_lines, start, end)
+        if is_similar_window(signature, seen_signatures, DEFAULT_WINDOW_DEDUPE_THRESHOLD):
+            duplicate_skipped += 1
+            continue
+        selected.append(item)
+        if signature:
+            seen_signatures.append(signature)
+        if len(selected) >= max_windows:
+            break
+
     selected.sort(key=lambda item: item[1])
+    stats["deduped_window_count"] = len(selected)
+    stats["duplicate_window_skipped"] = duplicate_skipped
+    stats["window_dedupe_threshold"] = DEFAULT_WINDOW_DEDUPE_THRESHOLD
     stats["selected_scores"] = [item[0] for item in selected]
     stats["max_score"] = max(stats["selected_scores"] or [0])
 
-    merged: list[tuple[int, int, int, dict[str, list[str]]]] = []
-    for score, start, end, hits in selected:
-        if not merged or start > merged[-1][2]:
-            merged.append((score, start, end, hits))
-            continue
-        prev_score, prev_start, prev_end, prev_hits = merged[-1]
-        merged_hits = {
-            group: sorted(set(prev_hits.get(group, [])) | set(hits.get(group, [])))
-            for group in set(prev_hits) | set(hits)
-        }
-        merged[-1] = (max(prev_score, score), prev_start, max(prev_end, end), merged_hits)
-
     chunks: list[str] = []
-    for idx, (score, start, end, hits) in enumerate(merged, start=1):
+    for idx, (score, start, end, hits) in enumerate(selected, start=1):
         hit_parts = []
         for group, words in hits.items():
             if words:
@@ -419,10 +670,55 @@ def collect_candidate_windows(
         chunks.append(
             f"[候选窗口 {idx}] score={score}; " + "；".join(hit_parts) + "\n" + "\n".join(chunk_lines)
         )
+
+    selected_object_words: set[str] = set()
+    selected_ranges = [(start, end) for _, start, end, _ in selected]
+    for _, _, _, hits in selected:
+        selected_object_words.update(hit_words_by_group_name(hits, "对象"))
+
+    support_windows: list[tuple[int, int, int, dict[str, list[str]]]] = []
+    if selected_object_words:
+        weak_scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        support_signatures: list[str] = []
+        support_ranges: list[tuple[int, int]] = []
+        for score, start, end, hits in weak_scored:
+            if overlaps_any_window(start, end, selected_ranges) or overlaps_any_window(start, end, support_ranges):
+                continue
+            weak_object_words = hit_words_by_group_name(hits, "对象")
+            if not selected_object_words.intersection(weak_object_words):
+                continue
+            signature = window_signature(raw_lines, start, end)
+            if is_similar_window(signature, support_signatures, DEFAULT_WINDOW_DEDUPE_THRESHOLD):
+                continue
+            support_windows.append((score, start, end, hits))
+            support_ranges.append((start, end))
+            if signature:
+                support_signatures.append(signature)
+            if len(support_windows) >= DEFAULT_SUPPORT_CONTEXT_WINDOWS:
+                break
+
+    support_windows.sort(key=lambda item: item[1])
+    stats["support_window_count"] = len(support_windows)
+    for idx, (score, start, end, hits) in enumerate(support_windows, start=1):
+        hit_parts = []
+        for group, words in hits.items():
+            if words:
+                hit_parts.append(f"{group}=" + "、".join(words))
+        chunk_lines = []
+        for line_no in range(start + 1, end + 1):
+            line = raw_lines[line_no - 1]
+            if len(line) > max_line_chars:
+                line = line[:max_line_chars] + "……[本行已截断]"
+            chunk_lines.append(f"{line_no:04d}: {line}")
+        chunks.append(
+            f"[辅助上下文 {idx}] score={score}; " + "；".join(hit_parts) + "\n" + "\n".join(chunk_lines)
+        )
+
     scoring_context = collect_scoring_weight_context(raw_lines)
     if scoring_context:
-        chunks.insert(
-            0,
+        # 候选证据窗口必须优先进入 prompt；评分折算上下文只是辅助材料，
+        # 不能因为全局评分表过长而挤掉真正的风险证据。
+        chunks.append(
             "[评分折算上下文]\n"
             "以下内容用于判断“内部满分”和“实际总分权重”的关系；"
             "审查评分项时必须优先读取。\n"
@@ -431,7 +727,80 @@ def collect_candidate_windows(
     excerpt = "\n\n".join(chunks)
     if len(excerpt) > max_excerpt_chars:
         excerpt = excerpt[:max_excerpt_chars] + "\n\n[候选窗口已按 max-review-excerpt-chars 截断]"
-    return excerpt, len(merged), stats
+    return excerpt, len(selected), stats
+
+
+def collect_candidate_windows_result(
+    review_text: str,
+    keyword_groups: dict[str, list[str]],
+    checkpoint_id: str,
+    checkpoint_title: str,
+    context_before: int,
+    context_after: int,
+    max_windows: int,
+    max_line_chars: int,
+    max_excerpt_chars: int,
+    min_candidate_score: int,
+) -> dict[str, Any]:
+    excerpt, window_count, stats = collect_candidate_windows(
+        review_text,
+        keyword_groups,
+        checkpoint_id,
+        checkpoint_title,
+        context_before,
+        context_after,
+        max_windows,
+        max_line_chars,
+        max_excerpt_chars,
+        min_candidate_score,
+    )
+    return {
+        "review_excerpt": excerpt,
+        "window_count": window_count,
+        "recall_stats": stats,
+    }
+
+
+def choose_review_recall(
+    review_variants: dict[str, Any],
+    keyword_groups: dict[str, list[str]],
+    checkpoint_id: str,
+    checkpoint_title: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    review_text = review_variants.get("structured_text") or review_variants["plain_text"]
+    extractor = review_variants.get("structured_extractor") or review_variants["plain_extractor"]
+    result = collect_candidate_windows_result(
+        review_text,
+        keyword_groups,
+        checkpoint_id,
+        checkpoint_title,
+        args.context_before,
+        args.context_after,
+        args.max_windows,
+        args.max_line_chars,
+        args.max_review_excerpt_chars,
+        args.min_candidate_score,
+    )
+    result["extractor"] = extractor
+    result["channel"] = "structured-line" if review_variants.get("structured_text") else "plain-line"
+    result["review_text"] = review_text
+    result["structured_stats"] = review_variants.get("structured_stats", {})
+    result["recall_config"] = {
+        "recall_unit": "line",
+        "context_before": args.context_before,
+        "context_after": args.context_after,
+        "max_windows": args.max_windows,
+        "max_review_excerpt_chars": args.max_review_excerpt_chars,
+        "candidate_pool_factor": DEFAULT_CANDIDATE_POOL_FACTOR,
+        "window_dedupe_threshold": DEFAULT_WINDOW_DEDUPE_THRESHOLD,
+        "window_merge_gap": DEFAULT_WINDOW_MERGE_GAP,
+        "short_line_lookahead": DEFAULT_SHORT_LINE_LOOKAHEAD,
+        "support_context_windows": DEFAULT_SUPPORT_CONTEXT_WINDOWS,
+    }
+    result["fallback_used"] = False
+    result["recall_fallback_reason"] = review_variants.get("structured_error", "")
+    return result
 
 
 def build_messages(
@@ -572,7 +941,49 @@ def parse_model_json(response: dict[str, Any]) -> dict[str, Any]:
     try:
         return json.loads(content)
     except json.JSONDecodeError as exc:
+        recovered = recover_partial_model_json(content)
+        if recovered:
+            return recovered
         raise RuntimeError(f"模型未返回合法 JSON：{content[:1000]}") from exc
+
+
+def recover_partial_model_json(content: str) -> dict[str, Any] | None:
+    """Best-effort recovery for small-model responses truncated after key fields."""
+    verdict_match = re.search(r'"verdict"\s*:\s*"(命中|待人工复核|不命中)"', content)
+    if not verdict_match:
+        return None
+    def field(name: str) -> str:
+        match = re.search(rf'"{re.escape(name)}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content)
+        if not match:
+            return ""
+        try:
+            return json.loads(f'"{match.group(1)}"')
+        except json.JSONDecodeError:
+            return match.group(1)
+    return {
+        "nbd_id": field("nbd_id") or field("checkpoint_id"),
+        "nbd_title": field("nbd_title") or field("checkpoint_title"),
+        "checkpoint_id": field("checkpoint_id") or field("nbd_id"),
+        "checkpoint_title": field("checkpoint_title") or field("nbd_title"),
+        "risk_level": field("risk_level"),
+        "result_type": field("result_type") or "其他",
+        "verdict": verdict_match.group(1),
+        "summary": field("summary") or "模型返回 JSON 截断，已根据 verdict 字段恢复。",
+        "candidate_count": 0,
+        "execution_trace": {
+            "candidate_recall": {"status": "已执行", "summary": "partial-json-recovered"},
+            "context_reading": {"status": "已执行", "summary": ""},
+            "clause_classification": {"status": "已执行", "summary": "", "clause_types": []},
+            "hit_conditions": {"status": "已执行", "A": False, "B": False, "C": False, "summary": ""},
+            "exclusion_checks": {"status": "已执行", "triggered": [], "not_triggered": []},
+            "result_branch": {"status": "已执行", "branch": verdict_match.group(1), "reason": "partial-json-recovered"},
+        },
+        "candidates": [],
+        "risk_tip": "",
+        "revision_suggestion": "",
+        "legal_basis": [],
+        "recovered_from_invalid_json": True,
+    }
 
 
 def normalize_result(result: dict[str, Any], checkpoint_id: str, checkpoint_title: str) -> dict[str, Any]:
@@ -640,6 +1051,8 @@ def trace_step_summary(key: str, step: dict[str, Any]) -> str:
 def markdown_report(report: dict[str, Any]) -> str:
     result = report["model_result"]
     candidates = result.get("candidates", [])
+    recall_fallback_reason = str(report.get("recall_fallback_reason", "")).strip()
+    recall_channel = str(report.get("recall_channel", "")).strip()
     lines = [
         f"# {report['checkpoint_id']} {report['checkpoint_title']} 验证报告",
         "",
@@ -650,6 +1063,10 @@ def markdown_report(report: dict[str, Any]) -> str:
         f"- 检查点：{report['checkpoint_path']}",
         f"- 待审文件：{display_file_name(report.get('review_file', ''))}",
         f"- 文本抽取方式：{report['text_extractor']}",
+        f"- 候选召回通道：{recall_channel or 'plain'}",
+        f"- 候选窗口数：{report.get('candidate_window_count', 0)}",
+        f"- 召回统计：`{json.dumps(report.get('recall_stats', {}), ensure_ascii=False)}`",
+        f"- 召回配置：`{json.dumps(report.get('recall_config', {}), ensure_ascii=False)}`",
         "",
         "## 结论",
         f"- 结果：{result.get('verdict', '待人工复核')}",
@@ -657,6 +1074,8 @@ def markdown_report(report: dict[str, Any]) -> str:
         "",
         "## 执行过程",
     ]
+    if recall_fallback_reason:
+        lines.extend(["", "## 召回说明", f"- {recall_fallback_reason}", ""])
     trace = result.get("execution_trace", {})
     for key, label in [
         ("candidate_recall", "候选召回"),
@@ -713,6 +1132,7 @@ def summary_markdown(report: dict[str, Any]) -> str:
             f"- 待审文件：{display_file_name(report.get('review_file', ''))}",
             f"- 结果：{result.get('verdict', '待人工复核')}",
             f"- 摘要：{result.get('summary', '')}",
+            f"- 召回通道：{report.get('recall_channel', 'plain')}",
             f"- 开始时间：{report['started_at']}",
             f"- 结束时间：{report['ended_at']}",
             f"- 报告：[[{Path(report['report_file']).name}]]",
@@ -1577,6 +1997,10 @@ def default_batch_output_dir(review_file: Path) -> Path:
     return DEFAULT_OUTPUT_ROOT / f"batch-{slugify_filename(review_file.stem)}-{run_id()}"
 
 
+def default_theme_output_dir(theme_file: Path, review_file: Path) -> Path:
+    return DEFAULT_OUTPUT_ROOT / f"theme-{slugify_filename(theme_file.stem)}-{slugify_filename(review_file.stem)}-{run_id()}"
+
+
 def expand_checkpoint_glob(pattern: str) -> list[Path]:
     matches = [Path(item).resolve() for item in glob.glob(pattern)]
     if not matches:
@@ -1587,12 +2011,228 @@ def expand_checkpoint_glob(pattern: str) -> list[Path]:
     return checkpoint_paths
 
 
+def split_markdown_table_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    cells: list[str] = []
+    current: list[str] = []
+    wikilink_depth = 0
+    idx = 0
+    while idx < len(stripped):
+        char = stripped[idx]
+        pair = stripped[idx : idx + 2]
+        if pair == "[[":
+            wikilink_depth += 1
+            current.append(pair)
+            idx += 2
+            continue
+        if pair == "]]" and wikilink_depth:
+            wikilink_depth -= 1
+            current.append(pair)
+            idx += 2
+            continue
+        if char == "|" and wikilink_depth == 0:
+            cells.append("".join(current).strip())
+            current = []
+            idx += 1
+            continue
+        current.append(char)
+        idx += 1
+    cells.append("".join(current).strip())
+    return cells
+
+
+def extract_bd_ids(value: str) -> list[str]:
+    seen: set[str] = set()
+    ids: list[str] = []
+    for match in re.finditer(r"\bBD\d{2}-\d{3}\b", value):
+        bd_id = match.group(0)
+        if bd_id not in seen:
+            seen.add(bd_id)
+            ids.append(bd_id)
+    return ids
+
+
+def resolve_checkpoint_by_id(checkpoint_id: str) -> Path:
+    matches = sorted((WORKSPACE_ROOT / "wiki" / "checkpoints").glob(f"{checkpoint_id}*.md"))
+    if not matches:
+        raise RuntimeError(f"主题引用的检查点不存在：{checkpoint_id}")
+    return matches[0].resolve()
+
+
+def parse_theme_file(theme_file: Path) -> dict[str, Any]:
+    theme_text = read_text(theme_file)
+    title = extract_title(theme_text) or theme_file.stem
+    items: list[dict[str, Any]] = []
+    in_mapping = False
+    headers: list[str] = []
+    for line in theme_text.splitlines():
+        if line.startswith("## "):
+            in_mapping = "XJGZ 到 BD 组合映射" in line
+            continue
+        if not in_mapping or not line.strip().startswith("|"):
+            continue
+        cells = split_markdown_table_row(line)
+        if not cells:
+            continue
+        if cells[0] == "---" or all(set(cell) <= {"-", ":"} for cell in cells if cell):
+            continue
+        if cells[0] == "业务事项":
+            headers = cells
+            continue
+        if not headers or len(cells) < len(headers):
+            continue
+        row = dict(zip(headers, cells))
+        xjgz_id = row.get("业务事项", "").strip()
+        if not xjgz_id:
+            continue
+        bd_ids = extract_bd_ids(row.get("建议调度 BD", ""))
+        items.append(
+            {
+                "xjgz_id": xjgz_id,
+                "description": row.get("检查事项描述", "").strip(),
+                "coverage_type": row.get("覆盖类型", "").strip(),
+                "bd_ids": bd_ids,
+                "coverage_note": row.get("覆盖说明", "").strip(),
+            }
+        )
+    if not items:
+        raise RuntimeError(f"主题页未解析到 XJGZ 到 BD 映射表：{relative_path(theme_file)}")
+    checkpoint_ids: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        for bd_id in item["bd_ids"]:
+            if bd_id not in seen:
+                seen.add(bd_id)
+                checkpoint_ids.append(bd_id)
+    return {
+        "theme_file": relative_path(theme_file),
+        "theme_title": title,
+        "items": items,
+        "checkpoint_ids": checkpoint_ids,
+    }
+
+
+def verdict_rank(verdict: str) -> int:
+    return {"命中": 3, "待人工复核": 2, "不命中": 1}.get(verdict, 0)
+
+
+def theme_item_verdict(results_by_id: dict[str, dict[str, Any]], bd_ids: list[str]) -> str:
+    verdict = "不命中"
+    for bd_id in bd_ids:
+        result = results_by_id.get(bd_id, {}).get("model_result", {})
+        current = str(result.get("verdict", ""))
+        if verdict_rank(current) > verdict_rank(verdict):
+            verdict = current
+    return verdict
+
+
+def write_theme_outputs(theme_dir: Path, theme: dict[str, Any]) -> tuple[Path, Path, Path]:
+    results = load_batch_results(theme_dir)
+    results_by_id = {str(item.get("checkpoint_id", "")): item for item in results}
+    rows: list[dict[str, Any]] = []
+    for item in theme["items"]:
+        bd_ids = item["bd_ids"]
+        matched_bds = [
+            bd_id
+            for bd_id in bd_ids
+            if results_by_id.get(bd_id, {}).get("model_result", {}).get("verdict") in {"命中", "待人工复核"}
+        ]
+        verdict = theme_item_verdict(results_by_id, bd_ids)
+        summaries = [
+            compact_text_value(results_by_id.get(bd_id, {}).get("model_result", {}).get("summary", ""), 180)
+            for bd_id in matched_bds
+        ]
+        rows.append(
+            {
+                "xjgz_id": item["xjgz_id"],
+                "description": item["description"],
+                "coverage_type": item["coverage_type"],
+                "bd_ids": bd_ids,
+                "matched_bds": matched_bds,
+                "verdict": verdict,
+                "summary": "；".join([summary for summary in summaries if summary]) or "未形成命中或待复核 BD 结论。",
+                "coverage_note": item["coverage_note"],
+            }
+        )
+
+    data = {
+        "report_type": "theme_validation_report",
+        "generated_at": now_text(),
+        "run_dir": relative_path(theme_dir),
+        "theme": theme,
+        "checkpoint_count": len(theme["checkpoint_ids"]),
+        "summary": {
+            "xjgz_item_count": len(rows),
+            "hit_count": sum(1 for row in rows if row["verdict"] == "命中"),
+            "manual_review_count": sum(1 for row in rows if row["verdict"] == "待人工复核"),
+            "clean_count": sum(1 for row in rows if row["verdict"] == "不命中"),
+        },
+        "items": rows,
+    }
+    json_file = theme_dir / "theme.json"
+    tsv_file = theme_dir / "theme-results.tsv"
+    report_file = theme_dir / "theme-report.md"
+    write_text(json_file, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    tsv_lines = [
+        "\t".join(
+            [
+                row["xjgz_id"],
+                row["verdict"],
+                row["coverage_type"],
+                ",".join(row["bd_ids"]),
+                ",".join(row["matched_bds"]),
+                row["summary"].replace("\n", " "),
+            ]
+        )
+        for row in rows
+    ]
+    write_text(tsv_file, "\n".join(tsv_lines) + ("\n" if tsv_lines else ""))
+
+    lines = [
+        f"# {theme['theme_title']} 主题验证报告",
+        "",
+        f"- 主题页：{theme['theme_file']}",
+        f"- 运行目录：{relative_path(theme_dir)}",
+        f"- XJGZ 事项数：{len(rows)}",
+        f"- 调度 BD 数：{len(theme['checkpoint_ids'])}",
+        f"- 命中事项：{data['summary']['hit_count']}",
+        f"- 待人工复核事项：{data['summary']['manual_review_count']}",
+        "",
+        "## 主题事项结果",
+        "",
+        "| XJGZ事项 | 结论 | 覆盖类型 | 调度BD | 命中/复核BD | 摘要 |",
+        "|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    row["xjgz_id"],
+                    row["verdict"],
+                    row["coverage_type"],
+                    ", ".join(row["bd_ids"]),
+                    ", ".join(row["matched_bds"]) or "-",
+                    compact_text_value(row["summary"], 220),
+                ]
+            )
+            + " |"
+        )
+    write_text(report_file, "\n".join(lines) + "\n")
+    return json_file, tsv_file, report_file
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="按 BD 检查点 SOP 调用小模型审查 1 份待审文件。"
     )
     parser.add_argument("--checkpoint", type=Path, help="BD 检查点 md 文件路径")
     parser.add_argument("--checkpoint-glob", help="批量验证检查点 glob，例如 'wiki/checkpoints/BD06-*.md'")
+    parser.add_argument("--theme-file", type=Path, help="主题组合页 md 文件路径；读取后展开为 BD 检查点批量验证")
     parser.add_argument("--review-file", type=Path, help="待审文件，支持 md/txt/doc/docx")
     parser.add_argument("--aggregate-run-dir", type=Path, help="汇总批次目录下的 result.json，生成审查报告.md")
     parser.add_argument("--output-dir", type=Path, help="输出目录，默认 validation/cli-runs/checkpoint-...")
@@ -1602,10 +2242,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=int, default=1800, help="接口超时秒数")
     parser.add_argument("--temperature", type=float, default=0.0, help="模型温度")
     parser.add_argument("--context-before", type=int, default=5, help="候选命中行前文行数")
-    parser.add_argument("--context-after", type=int, default=10, help="候选命中行后文行数")
-    parser.add_argument("--max-windows", type=int, default=12, help="最多提交候选窗口数")
+    parser.add_argument("--context-after", type=int, default=6, help="候选命中行后文行数")
+    parser.add_argument("--max-windows", type=int, default=5, help="最多提交候选窗口数")
     parser.add_argument("--max-line-chars", type=int, default=900, help="候选窗口中单行最大字符数")
-    parser.add_argument("--max-review-excerpt-chars", type=int, default=12000, help="候选窗口总字符上限")
+    parser.add_argument("--max-review-excerpt-chars", type=int, default=8000, help="候选窗口总字符上限")
     parser.add_argument("--max-checkpoint-chars", type=int, default=18000, help="检查点执行说明书字符上限")
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="模型最大输出 token")
     parser.add_argument("--min-candidate-score", type=int, default=DEFAULT_MIN_CANDIDATE_SCORE, help="低于该分数的弱候选不送入模型")
@@ -1635,30 +2275,44 @@ def run_single_validation(
     print(f"start {started_at} checkpoint={checkpoint_id} file={review_file.name}", flush=True)
 
     try:
-        review_text, extractor = load_review_file(review_file)
+        review_variants = load_review_file_variants(review_file)
         keyword_groups = parse_keyword_groups(checkpoint_text)
-        review_excerpt, window_count, recall_stats = collect_candidate_windows(
-            review_text,
+        recall_choice = choose_review_recall(
+            review_variants,
             keyword_groups,
             checkpoint_id,
             checkpoint_title,
-            args.context_before,
-            args.context_after,
-            args.max_windows,
-            args.max_line_chars,
-            args.max_review_excerpt_chars,
-            args.min_candidate_score,
+            args,
         )
+        review_excerpt = str(recall_choice["review_excerpt"])
+        window_count = int(recall_choice["window_count"])
+        recall_stats = dict(recall_choice["recall_stats"])
+        extractor = str(recall_choice["extractor"])
+        recall_channel = str(recall_choice.get("channel", "plain"))
+        recall_fallback_reason = str(recall_choice.get("recall_fallback_reason", ""))
+        fallback_used = bool(recall_choice.get("fallback_used", False))
         prompt_file = output_dir / "prompt.md"
         write_text(
             prompt_file,
             "# Prompt Preview\n\n"
             + f"- checkpoint: {checkpoint_id} {checkpoint_title}\n"
             + f"- review_file: {relative_path(review_file)}\n"
+            + f"- recall_channel: {recall_channel}\n"
+            + f"- fallback_used: {fallback_used}\n"
             + f"- candidate_windows: {window_count}\n\n"
             + f"- checkpoint_chars: {len(compact_text)}\n"
             + f"- review_excerpt_chars: {len(review_excerpt)}\n\n"
             + f"- recall_stats: {json.dumps(recall_stats, ensure_ascii=False)}\n\n"
+            + (
+                f"- recall_fallback_reason: {recall_fallback_reason}\n\n"
+                if recall_fallback_reason
+                else ""
+            )
+            + (
+                f"- structured_stats: {json.dumps(recall_choice.get('structured_stats', {}), ensure_ascii=False)}\n\n"
+                if recall_choice.get("structured_stats")
+                else ""
+            )
             + "## 检查点执行说明书\n\n"
             + compact_text
             + "\n\n"
@@ -1667,7 +2321,8 @@ def run_single_validation(
             + "\n",
         )
         print(
-            f"recall ok windows={window_count} raw_hits={recall_stats.get('raw_hit_count', 0)} "
+            f"recall ok channel={recall_channel} fallback={fallback_used} windows={window_count} "
+            f"raw_hits={recall_stats.get('raw_hit_count', 0)} "
             f"filtered_hits={recall_stats.get('filtered_hit_count', 0)} max_score={recall_stats.get('max_score', 0)}",
             flush=True,
         )
@@ -1710,8 +2365,13 @@ def run_single_validation(
             "checkpoint_path": relative_path(checkpoint_path),
             "review_file": relative_path(review_file),
             "text_extractor": extractor,
+            "recall_channel": recall_channel,
+            "recall_fallback_reason": recall_fallback_reason,
+            "fallback_used": fallback_used,
             "candidate_window_count": window_count,
             "recall_stats": recall_stats,
+            "recall_config": recall_choice.get("recall_config", {}),
+            "structured_stats": recall_choice.get("structured_stats", {}),
             "prompt_file": relative_path(prompt_file),
             "report_file": relative_path(report_file),
             "raw_response_file": relative_path(raw_response_file),
@@ -1814,6 +2474,90 @@ def run_batch_validation(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def run_theme_validation(args: argparse.Namespace) -> int:
+    if not args.review_file:
+        raise SystemExit("主题验证必须提供 --review-file。")
+    theme_file = args.theme_file.resolve()
+    review_file = args.review_file.resolve()
+    theme = parse_theme_file(theme_file)
+    checkpoint_paths = [resolve_checkpoint_by_id(checkpoint_id) for checkpoint_id in theme["checkpoint_ids"]]
+    theme_dir = (args.output_dir or default_theme_output_dir(theme_file, review_file)).resolve()
+    validate_output_dir(theme_dir)
+    theme_dir.mkdir(parents=True, exist_ok=True)
+    write_text(theme_dir / "theme-source.json", json.dumps(theme, ensure_ascii=False, indent=2) + "\n")
+    batch_log = theme_dir / "batch.log"
+    write_text(
+        batch_log,
+        f"theme_file={theme['theme_file']}\n"
+        f"theme_title={theme['theme_title']}\n"
+        f"theme_dir={relative_path(theme_dir)}\n"
+        f"review_file={relative_path(review_file)}\n"
+        f"checkpoint_count={len(checkpoint_paths)}\n"
+        f"jobs={args.jobs}\n"
+        + f"max_tokens={args.max_tokens}\n",
+    )
+
+    failures = 0
+    jobs = max(1, int(args.jobs or 1))
+
+    def append_log(text: str) -> None:
+        with batch_log.open("a", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def run_one(checkpoint_path: Path) -> tuple[str, str, int]:
+        checkpoint_text = read_text(checkpoint_path)
+        checkpoint_id = extract_checkpoint_id(checkpoint_text)
+        checkpoint_title = extract_title(checkpoint_text)
+        output_dir = theme_dir / checkpoint_id
+        if args.resume and (output_dir / "result.json").exists():
+            line = f"\n=== {checkpoint_id} skip existing {now_text()} ===\n"
+            append_log(line)
+            print(line.strip(), flush=True)
+            return checkpoint_id, checkpoint_title, 0
+        line = f"\n=== {checkpoint_id} start {now_text()} ===\n"
+        append_log(line)
+        print(line.strip(), flush=True)
+        status = run_single_validation(args, checkpoint_path, review_file, output_dir)
+        end_line = f"=== {checkpoint_id} end status={status} {now_text()} ===\n"
+        append_log(f"checkpoint_title={checkpoint_title}\n{end_line}")
+        print(end_line.strip(), flush=True)
+        return checkpoint_id, checkpoint_title, status
+
+    if jobs == 1:
+        for checkpoint_path in checkpoint_paths:
+            _, _, status = run_one(checkpoint_path)
+            if status != 0:
+                failures += 1
+    else:
+        print(f"theme parallel jobs={jobs}", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+            future_map = {executor.submit(run_one, checkpoint_path): checkpoint_path for checkpoint_path in checkpoint_paths}
+            for future in concurrent.futures.as_completed(future_map):
+                checkpoint_path = future_map[future]
+                try:
+                    _, _, status = future.result()
+                except Exception as exc:
+                    checkpoint_text = read_text(checkpoint_path)
+                    checkpoint_id = extract_checkpoint_id(checkpoint_text)
+                    append_log(f"=== {checkpoint_id} end status=1 {now_text()} exception={exc} ===\n")
+                    print(f"error {checkpoint_id} {exc}", flush=True)
+                    status = 1
+                if status != 0:
+                    failures += 1
+
+    if failures != len(checkpoint_paths):
+        results_file = write_results_tsv(theme_dir)
+        report_file, data_file = write_batch_audit_report(theme_dir)
+        theme_json, theme_tsv, theme_report = write_theme_outputs(theme_dir, theme)
+        print(
+            f"theme report ok results={relative_path(results_file)} output={relative_path(report_file)} "
+            f"theme={relative_path(theme_report)} data={relative_path(theme_json)} tsv={relative_path(theme_tsv)}",
+            flush=True,
+        )
+    print(f"theme done output={relative_path(theme_dir)} failures={failures}", flush=True)
+    return 1 if failures else 0
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
     if args.aggregate_run_dir:
@@ -1821,6 +2565,8 @@ def main() -> int:
         report_file, data_file = write_batch_audit_report(run_dir)
         print(f"report ok output={relative_path(report_file)} data={relative_path(data_file)}", flush=True)
         return 0
+    if args.theme_file:
+        return run_theme_validation(args)
     if args.checkpoint_glob:
         return run_batch_validation(args)
     if not args.checkpoint or not args.review_file:

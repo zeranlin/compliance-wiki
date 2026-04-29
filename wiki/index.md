@@ -39,6 +39,7 @@
 - [[rules/B层标准检查点方法论|B层标准检查点方法论]]
 - [[rules/B层标准检查点总库|B层标准检查点总库]]
 - [[checkpoints/index|B层标准检查点产品库]]
+- [[bd-review-points/index|新版 BD 审查点明细库]]
 - [[checkpoint-domains/index|BD 问题域调度层]]
 - [[rules/finding-编写规范|finding-编写规范]]
 - [[rules/finding-SOP-方法论|finding-SOP-方法论]]
