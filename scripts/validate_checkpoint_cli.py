@@ -350,6 +350,7 @@ def compact_checkpoint_text(markdown: str, max_chars: int) -> str:
         "检查点定义",
         "审查问题句",
         "定位与召回剖面",
+        "机器召回配置",
         "定位关键词",
         "候选召回规则",
         "上下文读取规则",
