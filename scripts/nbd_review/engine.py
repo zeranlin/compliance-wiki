@@ -7,17 +7,17 @@ This file intentionally remains thin so runtime orchestration does not grow into
 
 from __future__ import annotations
 
-from pipeline import (
+from business_review.pipeline import (
     run_build_prompt_stage,
     run_compile_document,
     run_compile_nbd,
-    run_lint_runtime,
     run_model_stage,
     run_preflight,
     run_recall_stage,
     run_report_stage,
     run_review,
 )
+from governance.lint_runtime import run_lint_runtime
 
 __all__ = [
     "run_build_prompt_stage",
