@@ -54,7 +54,10 @@ def gold_rows(payload: Any) -> list[dict[str, Any]]:
     rows = payload.get("检查结果") if isinstance(payload, dict) else payload
     if not isinstance(rows, list):
         raise ValueError("cannot find 检查结果 list in gold json")
-    return [row for row in rows if isinstance(row, dict)]
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("gold 检查结果 must contain only object rows")
+    return rows
 
 
 def row_line(row: dict[str, Any]) -> int | None:
@@ -115,6 +118,8 @@ def append_metadata_note(payload: Any, change: GoldChange) -> None:
 def apply_add_gold(rows: list[dict[str, Any]], change: GoldChange) -> None:
     if not change.risk_text:
         raise ValueError("add-gold requires --risk-text")
+    if matching_rows(rows, change.line, change.new_checkpoint or change.checkpoint):
+        return
     rows.append(
         {
             "行号": change.line,

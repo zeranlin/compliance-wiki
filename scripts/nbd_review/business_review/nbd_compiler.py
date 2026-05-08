@@ -78,6 +78,7 @@ def nbd_ir_from_item(item: NBDItem) -> dict[str, Any]:
             "context_rules": vcc.extract_section(item.markdown, "上下文读取规则"),
         },
         "sop": sections,
+        "output_constraints": parse_output_constraints(item.markdown),
         "output": {
             "risk_tip": vcc.extract_section(item.markdown, "风险提示"),
             "revision_suggestion": vcc.extract_section(item.markdown, "修改建议"),
@@ -157,6 +158,7 @@ def nbd_prompt_ir_from_item(item: NBDItem) -> dict[str, Any]:
         "exclusion_conditions": sections["exclusion_conditions"],
         "manual_review_boundaries": sections["manual_review_boundaries"],
         "verdict_policy": sections["verdict_policy"],
+        "output_constraints": parse_output_constraints(item.markdown),
         "risk_tip": vcc.extract_section(item.markdown, "风险提示"),
         "revision_suggestion": vcc.extract_section(item.markdown, "修改建议"),
         "legal_basis": vcc.extract_section(item.markdown, "审查依据"),
@@ -451,6 +453,84 @@ def parse_recall_profile(markdown: str, keyword_groups: dict[str, list[str]]) ->
     }
 
 
+def parse_output_constraints(markdown: str) -> dict[str, Any]:
+    """Parse generic model-output constraints declared by an NBD markdown page.
+
+    These constraints are executable protocol hints, not business rules owned by
+    the runtime. The runtime only interprets simple structural constraints such
+    as candidate count, section role, and candidate-window completeness keys.
+    """
+    section = vcc.extract_section(markdown, "机器输出约束")
+    if not section:
+        return {}
+    constraints: dict[str, Any] = {}
+    current_group = ""
+    groups: dict[str, list[str]] = {}
+    for line in section.splitlines():
+        heading = re.match(r"^###\s+(.+?)\s*$", line)
+        if heading:
+            current_group = heading.group(1).strip()
+            groups.setdefault(current_group, [])
+            continue
+        item = re.match(r"^-\s+(.+?)\s*$", line)
+        if not item:
+            continue
+        value = item.group(1).strip().rstrip("。；;")
+        if not value:
+            continue
+        key_value = re.match(r"^([^：:]+)[：:]\s*(.+?)\s*$", value)
+        if key_value:
+            key = key_value.group(1).strip()
+            raw = key_value.group(2).strip()
+            if key in {"正向候选最多数量", "max_positive_candidates"}:
+                nums = re.findall(r"\d+", raw)
+                if nums:
+                    constraints["max_positive_candidates"] = max(0, int(nums[0]))
+                continue
+            if key in {"正向候选允许章节角色", "allowed_section_roles"}:
+                constraints["allowed_section_roles"] = split_constraint_values(raw)
+                continue
+            if key in {"正向候选排除章节角色", "excluded_section_roles"}:
+                constraints["excluded_section_roles"] = split_constraint_values(raw)
+                continue
+            if key in {"正向候选必备完整性", "required_completeness"}:
+                constraints["required_completeness"] = split_constraint_values(raw)
+                continue
+            if key in {"正向候选排除文本模式", "excluded_text_patterns"}:
+                constraints["excluded_text_patterns"] = split_constraint_patterns(raw)
+                continue
+            if key in {"正向候选选择策略", "positive_selection_strategy"}:
+                constraints["positive_selection_strategy"] = raw
+                continue
+        if current_group:
+            groups.setdefault(current_group, []).append(value)
+    for name, values in groups.items():
+        if "允许章节" in name:
+            constraints["allowed_section_roles"] = list(dict.fromkeys(values))
+        elif "排除章节" in name:
+            constraints["excluded_section_roles"] = list(dict.fromkeys(values))
+        elif "完整性" in name or "必备" in name:
+            constraints["required_completeness"] = list(dict.fromkeys(values))
+        elif "排除文本" in name or "排除模式" in name:
+            constraints["excluded_text_patterns"] = list(dict.fromkeys(values))
+        else:
+            protocol_notes = constraints.setdefault("protocol_notes", [])
+            protocol_notes.extend(values)
+    if "protocol_notes" in constraints:
+        constraints["protocol_notes"] = list(dict.fromkeys(constraints["protocol_notes"]))
+    return {key: value for key, value in constraints.items() if value not in (None, [], {})}
+
+
+def split_constraint_values(raw: str) -> list[str]:
+    values = re.split(r"[,，、/|]\s*|\s+", raw)
+    return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+def split_constraint_patterns(raw: str) -> list[str]:
+    values = re.split(r"[；;]\s*", raw)
+    return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
 def parse_theme_ids(path: Path) -> list[str]:
     meta = vcc.parse_frontmatter(read_text(path))
     value = meta.get("nbd_ids")
@@ -523,6 +603,7 @@ def compact_text_from_prompt_ir(payload: dict[str, Any]) -> str:
         ("排除条件", payload.get("exclusion_conditions")),
         ("待人工复核边界", payload.get("manual_review_boundaries")),
         ("判断结果分流", payload.get("verdict_policy")),
+        ("机器输出约束", render_output_constraints(payload.get("output_constraints"))),
         ("风险提示", payload.get("risk_tip")),
         ("修改建议", payload.get("revision_suggestion")),
         ("审查依据", payload.get("legal_basis")),
@@ -531,6 +612,24 @@ def compact_text_from_prompt_ir(payload: dict[str, Any]) -> str:
         if value:
             lines.extend([f"## {title}", str(value)])
     return "\n\n".join(lines)
+
+
+def render_output_constraints(value: Any) -> str:
+    if not isinstance(value, dict) or not value:
+        return ""
+    lines: list[str] = []
+    if value.get("max_positive_candidates") is not None:
+        lines.append(f"- 正向候选最多数量：{value.get('max_positive_candidates')}")
+    if value.get("allowed_section_roles"):
+        lines.append("- 正向候选允许章节角色：" + "、".join(str(item) for item in value.get("allowed_section_roles") or []))
+    if value.get("excluded_section_roles"):
+        lines.append("- 正向候选排除章节角色：" + "、".join(str(item) for item in value.get("excluded_section_roles") or []))
+    if value.get("required_completeness"):
+        lines.append("- 正向候选必备完整性：" + "、".join(str(item) for item in value.get("required_completeness") or []))
+    if value.get("protocol_notes"):
+        lines.append("### 正向候选代表行协议")
+        lines.extend(f"- {str(item)}" for item in value.get("protocol_notes") or [])
+    return "\n".join(lines)
 
 
 def compact_text_from_nbd_ir(payload: dict[str, Any]) -> str:
@@ -549,6 +648,7 @@ def compact_text_from_nbd_ir(payload: dict[str, Any]) -> str:
         "exclusion_conditions": (payload.get("sop") or {}).get("exclusion_conditions"),
         "manual_review_boundaries": (payload.get("sop") or {}).get("manual_review_boundaries"),
         "verdict_policy": (payload.get("sop") or {}).get("verdict_policy"),
+        "output_constraints": payload.get("output_constraints") or {},
         "risk_tip": (payload.get("output") or {}).get("risk_tip"),
         "revision_suggestion": (payload.get("output") or {}).get("revision_suggestion"),
         "legal_basis": (payload.get("output") or {}).get("legal_basis"),
@@ -573,6 +673,11 @@ def item_from_nbd_ir(payload: dict[str, Any], prompt_ir: dict[str, Any] | None =
     meta.setdefault("status", payload.get("status", ""))
     for key, value in (payload.get("scope") or {}).items():
         meta.setdefault(key, value)
+    output_constraints = payload.get("output_constraints")
+    if not output_constraints and isinstance(prompt_ir, dict):
+        output_constraints = prompt_ir.get("output_constraints")
+    if isinstance(output_constraints, dict) and output_constraints:
+        meta["_output_constraints"] = output_constraints
     recall = payload.get("recall") or {}
     return NBDItem(
         nbd_id=str(payload.get("id") or ""),

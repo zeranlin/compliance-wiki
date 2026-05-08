@@ -233,9 +233,20 @@ def run_case_quality_command(args: argparse.Namespace) -> int:
     from shared.utils import relative_path
 
     payload = run_case_quality(args)
-    print(relative_path(Path(payload["evaluation_v2_dir"])))
-    print(f"V1_F1={payload['v1']['f1']:.4f}")
-    print(f"V2_F1={payload['v2']['f1']:.4f}")
+    primary_dir = next(
+        (
+            payload.get(key)
+            for key in ("evaluation_v4_dir", "evaluation_v3_dir", "evaluation_v2_dir", "evaluation_v1_dir")
+            if payload.get(key)
+        ),
+        "",
+    )
+    if primary_dir:
+        print(relative_path(Path(primary_dir)))
+    for key in ("v1", "v2", "v3", "v4"):
+        metrics = payload.get(key)
+        if isinstance(metrics, dict):
+            print(f"{key.upper()}_F1={metrics['f1']:.4f}")
     return 0
 
 
@@ -275,7 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.set_defaults(func=run_preflight)
 
     lint_runtime = sub.add_parser("lint-runtime", help="检查运行时代码是否混入 NBD 专属业务硬编码")
-    lint_runtime.add_argument("--path", type=Path, help="默认检查 scripts/nbd_review")
+    lint_runtime.add_argument("--path", type=Path, help="默认检查 scripts/nbd_review/business_review")
     lint_runtime.set_defaults(func=run_lint_runtime)
 
     compile_document = sub.add_parser("compile-document", help="编译待审文件为 Document IR")
@@ -308,7 +319,7 @@ def build_parser() -> argparse.ArgumentParser:
     export_gold_like.add_argument("--include-no-line", action=argparse.BooleanOptionalAction, default=True)
     export_gold_like.set_defaults(func=run_export_gold_like)
 
-    evaluate_f1 = sub.add_parser("evaluate-f1", help="质量评测层：计算标准答案 V1/V2 相对 NBD run 的召回率、精确率和 F1")
+    evaluate_f1 = sub.add_parser("evaluate-f1", help="质量评测层：计算指定金标相对 NBD run 的召回率、精确率和 F1")
     evaluate_f1.add_argument("--gold-json", required=True, type=Path, help="标准答案 JSON")
     evaluate_f1.add_argument("--run-dir", required=True, type=Path, help="NBD CLI 输出目录")
     evaluate_f1.add_argument("--output-dir", type=Path, help="评测结果输出目录")
@@ -392,10 +403,12 @@ def build_parser() -> argparse.ArgumentParser:
     update_summary.add_argument("--file-label", help="可选：覆盖文件列")
     update_summary.set_defaults(func=run_update_f1_summary)
 
-    case_quality = sub.add_parser("case-quality", help="质量评测层：执行单案例 V1/V2 评测、健康检查、总表回写流水线")
+    case_quality = sub.add_parser("case-quality", help="质量评测层：执行单案例 V1/V2/V3/V4 评测、健康检查、总表回写流水线")
     case_quality.add_argument("--run-dir", required=True, type=Path)
     case_quality.add_argument("--gold-v1", required=True, type=Path)
     case_quality.add_argument("--gold-v2", required=True, type=Path)
+    case_quality.add_argument("--gold-v3", type=Path, help="可选：V3 金标 JSON")
+    case_quality.add_argument("--gold-v4", type=Path, help="可选：V4 金标 JSON")
     case_quality.add_argument("--case-no", type=int)
     case_quality.add_argument("--sample-name", default="")
     case_quality.add_argument("--item-category", default="")

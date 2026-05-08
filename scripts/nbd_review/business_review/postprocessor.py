@@ -29,6 +29,14 @@ SUPPORT_SECTION_ROLES = {"catalog", "common_terms", "bid_format", "contract_temp
 NUMERIC_TERMS = ["权重", "总和", "分值", "比例", "金额", "期限", "数量", "超过", "不得低于", "不得超过", "计算"]
 POSITIVE_VERDICTS = {"命中", "待人工复核"}
 VERDICT_PRIORITY = {"命中": 2, "待人工复核": 1, "不命中": 0, "": 0}
+SELF_REJECT_PATTERNS = [
+    r"不命中",
+    r"不得命中",
+    r"不能(?:作为|输出|进入)?命中",
+    r"不(?:构成|属于|进入).{0,12}(?:风险|命中|candidate|candidates)",
+    r"按(?:照)?排除条件.{0,12}(?:不命中|排除)",
+    r"需(?:重新检查|寻找其他命中项|寻找更明确)",
+]
 
 
 def _parse_line_anchor(value: Any) -> tuple[int, int] | None:
@@ -101,6 +109,193 @@ def _candidate_is_positive(candidate: dict[str, Any], fallback_verdict: str) -> 
     return str(candidate.get("candidate_verdict") or fallback_verdict).strip() in POSITIVE_VERDICTS
 
 
+def _candidate_self_rejected(candidate: dict[str, Any]) -> bool:
+    """Return true when the model's own candidate reason rejects the candidate.
+
+    This is a generic JSON consistency check. It does not know any NBD business
+    rules; it only prevents a candidate from being positive when the same reason
+    text explicitly says the candidate should not be positive.
+    """
+    reason = str(candidate.get("reason") or "")
+    if not reason:
+        return False
+    reason = re.sub(r"\s+", "", reason)
+    reason = reason.replace("未命中排除条件", "")
+    reason = reason.replace("没有命中排除条件", "")
+    return any(re.search(pattern, reason) for pattern in SELF_REJECT_PATTERNS)
+
+
+def prune_self_rejected_positive_candidates(row: dict[str, Any]) -> bool:
+    """Prune positive candidates contradicted by their own reason text."""
+    result = row.get("model_result")
+    if not isinstance(result, dict):
+        return False
+    candidates = result.get("candidates")
+    if not isinstance(candidates, list):
+        return False
+    fallback_verdict = str(result.get("verdict") or "").strip()
+    pruned: list[Any] = []
+    rejected: list[dict[str, Any]] = []
+    changed = False
+    for candidate in candidates:
+        if (
+            isinstance(candidate, dict)
+            and _candidate_is_positive(candidate, fallback_verdict)
+            and _candidate_self_rejected(candidate)
+        ):
+            changed = True
+            candidate = dict(candidate)
+            candidate["candidate_verdict"] = "不命中"
+            candidate["hit_condition_met"] = False
+            rejected.append(candidate)
+            continue
+        pruned.append(candidate)
+    if not changed:
+        return False
+    positive_left = [
+        candidate
+        for candidate in pruned
+        if isinstance(candidate, dict) and _candidate_is_positive(candidate, fallback_verdict)
+    ]
+    if not positive_left:
+        pruned.extend(rejected[:3])
+        result["verdict"] = "不命中"
+        trace = result.get("execution_trace")
+        if isinstance(trace, dict):
+            branch = trace.get("result_branch")
+            if isinstance(branch, dict):
+                branch["branch"] = "不命中"
+                reason = str(branch.get("reason") or "").strip()
+                branch["reason"] = (reason + "；" if reason else "") + "运行时发现全部正向候选的 reason 已自我排除，按结构一致性修正为不命中。"
+    result["candidates"] = pruned
+    result["candidate_count"] = len(pruned)
+    repairs = [repair for repair in (row.get("runtime_repairs") or []) if isinstance(repair, dict)]
+    repairs.append(
+        {
+            "code": "self_rejected_positive_candidate_pruned",
+            "message": f"已移除 {len(rejected)} 条 reason 自我排除却标为正向的候选，保证候选结论与理由一致。",
+        }
+    )
+    row["runtime_repairs"] = repairs
+    return True
+
+
+def prune_output_constraint_violations(row: dict[str, Any]) -> bool:
+    """Apply generic output constraints compiled from an NBD page.
+
+    The runtime does not know why a completeness key matters. It only enforces
+    the NBD-declared structural contract against already recalled candidate
+    windows and model-emitted candidates.
+    """
+    constraints = row.get("output_constraints")
+    if not isinstance(constraints, dict) or not constraints:
+        return False
+    result = row.get("model_result")
+    if not isinstance(result, dict):
+        return False
+    candidates = result.get("candidates")
+    if not isinstance(candidates, list):
+        return False
+    windows = row.get("windows")
+    if not isinstance(windows, list):
+        windows = []
+    window_by_id = {
+        str(window.get("window_id") or ""): window
+        for window in windows
+        if isinstance(window, dict) and str(window.get("window_id") or "")
+    }
+    fallback_verdict = str(result.get("verdict") or "").strip()
+    allowed_roles = set(str(item) for item in constraints.get("allowed_section_roles") or [])
+    excluded_roles = set(str(item) for item in constraints.get("excluded_section_roles") or [])
+    required_completeness = [str(item) for item in constraints.get("required_completeness") or [] if str(item)]
+    excluded_text_patterns = [str(item) for item in constraints.get("excluded_text_patterns") or [] if str(item)]
+    selection_strategy = str(constraints.get("positive_selection_strategy") or "")
+    max_positive = constraints.get("max_positive_candidates")
+    candidate_entries = list(enumerate(candidates))
+    if isinstance(max_positive, int) and max_positive >= 0 and "最早行号" in selection_strategy:
+        candidate_entries.sort(key=lambda item: _parse_line_anchor(item[1].get("line_anchor")) or (10**9, 10**9) if isinstance(item[1], dict) else (10**9, 10**9))
+    pruned: list[Any] = []
+    rejected: list[dict[str, Any]] = []
+    positive_seen = 0
+    changed = False
+    for _, candidate in candidate_entries:
+        if not isinstance(candidate, dict) or not _candidate_is_positive(candidate, fallback_verdict):
+            pruned.append(candidate)
+            continue
+        window = window_by_id.get(str(candidate.get("candidate_id") or ""))
+        rejection_reason = output_constraint_rejection_reason(candidate, window, allowed_roles, excluded_roles, required_completeness, excluded_text_patterns)
+        if isinstance(max_positive, int) and max_positive >= 0 and positive_seen >= max_positive:
+            rejection_reason = rejection_reason or f"超过 NBD 声明的正向候选最多数量 {max_positive}"
+        if rejection_reason:
+            changed = True
+            candidate = dict(candidate)
+            candidate["candidate_verdict"] = "不命中"
+            candidate["hit_condition_met"] = False
+            candidate["exclusion_triggered"] = True
+            reason = str(candidate.get("reason") or "").strip()
+            candidate["reason"] = (reason + "；" if reason else "") + rejection_reason
+            rejected.append(candidate)
+            continue
+        positive_seen += 1
+        pruned.append(candidate)
+    if not changed:
+        return False
+    positive_left = [
+        candidate
+        for candidate in pruned
+        if isinstance(candidate, dict) and _candidate_is_positive(candidate, fallback_verdict)
+    ]
+    if not positive_left:
+        pruned.extend(rejected[:3])
+        result["verdict"] = "不命中"
+        trace = result.get("execution_trace")
+        if isinstance(trace, dict):
+            branch = trace.get("result_branch")
+            if isinstance(branch, dict):
+                branch["branch"] = "不命中"
+                reason = str(branch.get("reason") or "").strip()
+                branch["reason"] = (reason + "；" if reason else "") + "运行时按 NBD 机器输出约束移除全部正向候选。"
+    result["candidates"] = pruned
+    result["candidate_count"] = len(pruned)
+    repairs = [repair for repair in (row.get("runtime_repairs") or []) if isinstance(repair, dict)]
+    repairs.append(
+        {
+            "code": "nbd_output_constraint_violation_pruned",
+            "message": f"已按 NBD 机器输出约束移除 {len(rejected)} 条结构不合格的正向候选。",
+        }
+    )
+    row["runtime_repairs"] = repairs
+    return True
+
+
+def output_constraint_rejection_reason(
+    candidate: dict[str, Any],
+    window: dict[str, Any] | None,
+    allowed_roles: set[str],
+    excluded_roles: set[str],
+    required_completeness: list[str],
+    excluded_text_patterns: list[str],
+) -> str:
+    role = str((window or {}).get("section_role") or "")
+    if allowed_roles and role and role not in allowed_roles:
+        return f"候选章节角色 {role} 不在 NBD 允许正向角色内"
+    if excluded_roles and role in excluded_roles:
+        return f"候选章节角色 {role} 属于 NBD 排除正向角色"
+    completeness = (window or {}).get("completeness") or {}
+    if required_completeness and isinstance(completeness, dict):
+        missing = [key for key in required_completeness if not bool(completeness.get(key))]
+        if missing:
+            return "候选窗口缺少 NBD 要求的完整性要素：" + "、".join(missing)
+    text = " ".join([str(candidate.get("excerpt") or ""), str(candidate.get("reason") or ""), str((window or {}).get("text") or "")])
+    for pattern in excluded_text_patterns:
+        try:
+            if re.search(pattern, text):
+                return f"候选文本命中 NBD 排除文本模式：{pattern}"
+        except re.error:
+            continue
+    return ""
+
+
 def repair_verdict_candidate_consistency(row: dict[str, Any]) -> bool:
     """Align top-level verdict with model-emitted positive candidates.
 
@@ -145,15 +340,6 @@ def repair_verdict_candidate_consistency(row: dict[str, Any]) -> bool:
         }
     )
     row["runtime_repairs"] = repairs
-    return True
-
-
-def _window_role_matches_result(window: dict[str, Any], summary_text: str) -> bool:
-    role = str(window.get("section_role") or "")
-    if any(term in summary_text for term in ["评分", "评审", "得分", "加分", "不得分", "分值"]):
-        return role == "scoring"
-    if any(term in summary_text for term in ["合同", "履约", "验收", "付款", "保证金", "交货", "退还"]):
-        return role in {"business_terms", "business_primary", "technical_primary", "qualification_primary"}
     return True
 
 
@@ -436,89 +622,13 @@ def model_quality_flags(row: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def repair_positive_candidate_structure(row: dict[str, Any], max_candidates: int = 8) -> bool:
-    """Keep legacy repaired rows stable, but never synthesize new positive evidence.
+    """Do not synthesize positive evidence in the daily review runtime.
 
     A business hit must come from model-emitted structured candidates. The runtime may
     validate, prune, and flag model output, but it must not create candidate evidence
     from recalled windows after the model omitted it.
     """
-    result = row.get("model_result")
-    if not isinstance(result, dict):
-        return False
-    if result.get("recovered_from_invalid_json"):
-        return False
-    verdict = str(result.get("verdict") or "").strip()
-    if verdict not in POSITIVE_VERDICTS:
-        return False
-    candidates = result.get("candidates")
-    if not isinstance(candidates, list):
-        candidates = []
-    existing_repair = any(
-        isinstance(repair, dict) and repair.get("code") == "positive_candidate_structure_repaired"
-        for repair in (row.get("runtime_repairs") or [])
-    )
-    if not existing_repair:
-        return False
-    has_positive_candidate = any(
-        isinstance(candidate, dict)
-        and str(candidate.get("candidate_verdict") or verdict).strip() in POSITIVE_VERDICTS
-        and str(candidate.get("line_anchor") or "").strip()
-        for candidate in candidates
-    )
-    if has_positive_candidate and not existing_repair:
-        return False
-    windows = [window for window in (row.get("windows") or []) if isinstance(window, dict)]
-    if not windows:
-        return False
-    primary_windows = [window for window in windows if window.get("window_type") == "primary"]
-    selected = primary_windows or windows
-    summary_text = " ".join(
-        [
-            str(result.get("summary") or ""),
-            str(result.get("risk_tip") or ""),
-            str(result.get("revision_suggestion") or ""),
-        ]
-    )
-    repair_limit = max_candidates if re.search(r"多(?:个|项|处|条)|若干|一批|大量|分别|累计", summary_text) else 1
-    selected = [window for window in selected if _window_role_matches_result(window, summary_text)] or selected[:1]
-    repaired: list[dict[str, Any]] = []
-    for window in selected[:repair_limit]:
-        window_id = str(window.get("window_id") or "").strip()
-        line_anchor = str(window.get("line_anchor") or "").strip()
-        excerpt = clean_inline(window.get("text"), 120)
-        if not line_anchor or not excerpt:
-            continue
-        repaired.append(
-            {
-                "candidate_id": window_id,
-                "line_anchor": line_anchor,
-                "excerpt": excerpt,
-                "clause_type": str(window.get("section_role") or "其他"),
-                "window_type": str(window.get("window_type") or ""),
-                "evidence_strength": "中",
-                "hit_condition_met": verdict == "命中",
-                "exclusion_triggered": False,
-                "candidate_verdict": verdict,
-                "reason": "模型已给出正向结论，运行时按已召回候选窗口补齐证据回溯。",
-            }
-        )
-    if not repaired:
-        return False
-    result["candidates"] = repaired
-    repairs = [
-        repair
-        for repair in (row.get("runtime_repairs") or [])
-        if not (isinstance(repair, dict) and repair.get("code") == "positive_candidate_structure_repaired")
-    ]
-    repairs.append(
-        {
-            "code": "positive_candidate_structure_repaired",
-            "message": "模型正向结论缺少结构化候选，已使用已召回候选窗口补齐 candidate_id、line_anchor 和 excerpt。",
-            "candidate_count": len(repaired),
-        }
-    )
-    row["runtime_repairs"] = repairs
-    return True
+    return False
 
 
 def row_quality_flags(row: dict[str, Any]) -> list[dict[str, str]]:
@@ -645,23 +755,14 @@ def issue_types(rows: list[dict[str, Any]], evidence: dict[str, Any]) -> str:
 
 
 def business_family_label(row: dict[str, Any], evidence: dict[str, Any]) -> str:
-    """Presentation-only family labels; does not affect verdicts or evidence selection."""
+    """Presentation-only labels based on structured metadata, not evidence keywords."""
     meta = row.get("nbd", {}) or {}
-    title = str(meta.get("title") or "")
-    text = " ".join([title, str(evidence.get("clause_type") or ""), str(evidence.get("excerpt") or "")])
-    if any(word in text for word in ["资格", "供应商", "投标人资格"]):
-        return "资格条件"
-    if any(word in text for word in ["评分", "评审", "权重", "分值", "得分", "不得分"]):
-        return "评分规则"
-    if any(word in text for word in ["样品", "检测报告", "检验报告", "CMA", "标准", "检测"]):
-        return "样品检测"
-    if any(word in text for word in ["技术", "参数", "规格", "采购需求", "货物清单"]):
-        return "技术参数"
-    if any(word in text for word in ["合同", "付款", "履约", "验收", "保证金", "交货", "服务期"]):
-        return "商务合同"
-    if any(word in text for word in ["中小企业", "节能", "环保", "政府采购政策", "进口产品", "联合体"]):
-        return "政府采购政策"
-    return "其他"
+    for key in ("issue_family", "item_scope", "finding_type"):
+        value = str(meta.get(key) or "").strip()
+        if value:
+            return value
+    clause_type = str(evidence.get("clause_type") or "").strip()
+    return clause_type or "其他"
 
 
 def business_issue_rank(rows: list[dict[str, Any]]) -> int:
@@ -670,19 +771,9 @@ def business_issue_rank(rows: list[dict[str, Any]]) -> int:
         return 99
     evidence = best_group_evidence(rows)
     label = business_family_label(rows[0], evidence)
-    clause_type = str(evidence.get("clause_type") or "")
-    if label == "资格条件" and ("qualification" in clause_type or "资格" in clause_type):
-        return 0
-    order = {
-        "资格条件": 1,
-        "评分规则": 2,
-        "样品检测": 3,
-        "技术参数": 4,
-        "商务合同": 5,
-        "政府采购政策": 6,
-        "其他": 9,
-    }
-    return order.get(label, 9)
+    if label == "其他":
+        return 9
+    return 1
 
 
 def best_group_evidence(rows: list[dict[str, Any]]) -> dict[str, Any]:

@@ -68,23 +68,6 @@ class ScoredRow:
     source: str = "keyword"
 
 
-CHINESE_DIGITS = {
-    "一": 1,
-    "二": 2,
-    "两": 2,
-    "三": 3,
-    "四": 4,
-    "五": 5,
-    "六": 6,
-    "七": 7,
-    "八": 8,
-    "九": 9,
-    "十": 10,
-}
-STATISTICAL_REVIEW_TRIGGERS = ["数量", "份数", "累计", "统计", "超过", "不得超过", "原则上"]
-STATISTICAL_REVIEW_DECLARATIONS = ["全文统计型审查", "统计型单一风险", "统计型审查"]
-REPORT_OBJECT_TERMS = ["检验检测报告", "检测报告", "检验报告"]
-
 
 def group_words(keyword_groups: dict[str, list[str]], *parts: str) -> list[str]:
     words: list[str] = []
@@ -221,10 +204,10 @@ def profile_hits(block: DocumentBlock, item: NBDItem) -> list[str]:
     if not profile or not profile.get("enabled", True):
         return []
     ctext = compact(block.text)
-    conflict_hits = [term for term in profile.get("conflict_terms", []) if term and term in ctext]
+    conflict_hits = [term for term in profile.get("conflict_terms", []) if term and compact(term) in ctext]
     if conflict_hits:
         return []
-    hits = {term for term in profile.get("terms", []) if term and term in ctext}
+    hits = {term for term in profile.get("terms", []) if term and compact(term) in ctext}
     for pattern in profile.get("regex_terms", []):
         if not pattern:
             continue
@@ -322,13 +305,32 @@ def expanded_window_blocks(blocks: list[DocumentBlock], block: DocumentBlock, it
     neighbor_before = int(profile.get("neighbor_before", 0))
     neighbor_after = int(profile.get("neighbor_after", 1))
     result = [block]
+
+    def same_local_context(candidate: DocumentBlock) -> bool:
+        if candidate.section_role == block.section_role:
+            return True
+        if "\t" in block.text and "\t" in candidate.text:
+            return True
+        if block.section_path and candidate.section_path and block.section_path == candidate.section_path:
+            return True
+        return False
+
     for candidate in reversed(blocks[max(0, idx - neighbor_before) : idx]):
         first_line = candidate.lines[0].strip() if candidate.lines else candidate.text.strip()
-        if looks_like_heading(first_line) or candidate.section_role == block.section_role:
+        if looks_like_heading(first_line) or same_local_context(candidate):
             result.insert(0, candidate)
             continue
         break
-    if not looks_like_heading(block.lines[0].strip() if block.lines else block.text.strip()):
+    block_first_line = block.lines[0].strip() if block.lines else block.text.strip()
+    if not looks_like_heading(block_first_line):
+        for candidate in blocks[idx + 1 : min(len(blocks), idx + 1 + neighbor_after)]:
+            first_line = candidate.lines[0].strip() if candidate.lines else candidate.text.strip()
+            if looks_like_heading(first_line):
+                break
+            if same_local_context(candidate):
+                result.append(candidate)
+                continue
+            break
         return result
     for candidate in blocks[idx + 1 : min(len(blocks), idx + 1 + neighbor_after)]:
         first_line = candidate.lines[0].strip() if candidate.lines else candidate.text.strip()
@@ -522,155 +524,7 @@ def recall_diagnostics(item: NBDItem, windows: list[CandidateWindow], primary_co
     }
 
 
-def statistical_review_profile(item: NBDItem) -> dict[str, Any]:
-    """Infer generic counting needs from NBD runnable knowledge.
-
-    The runtime only discovers that a NBD asks for object counting. It does not
-    decide whether the count is compliant; that decision remains in the NBD SOP
-    and model execution.
-    """
-    text = compact(f"{item.title}\n{item.compact_text}")
-    if not any(term in text for term in STATISTICAL_REVIEW_DECLARATIONS):
-        return {"enabled": False}
-    if not any(term in text for term in STATISTICAL_REVIEW_TRIGGERS):
-        return {"enabled": False}
-
-    object_terms: list[str] = []
-    if any(term in text for term in REPORT_OBJECT_TERMS):
-        object_terms = REPORT_OBJECT_TERMS
-    if not object_terms:
-        return {"enabled": False}
-
-    threshold = statistical_threshold_from_text(text)
-    return {
-        "enabled": True,
-        "object_family": "报告",
-        "object_terms": object_terms,
-        "threshold": threshold,
-        "reason": "NBD 文本包含数量统计触发词和可统计对象词",
-    }
-
-
-def statistical_threshold_from_text(text: str) -> int | None:
-    for pattern in [r"不得超过(\d+)份", r"超过(\d+)份", r"原则上不得超过(\d+)份"]:
-        match = re.search(pattern, text)
-        if match:
-            return int(match.group(1))
-    for pattern in [r"不得超过([一二两三四五六七八九十])份", r"超过([一二两三四五六七八九十])份", r"原则上不得超过([一二两三四五六七八九十])份"]:
-        match = re.search(pattern, text)
-        if match:
-            return CHINESE_DIGITS.get(match.group(1))
-    return None
-
-
-def normalized_object_key(name: str, object_term: str) -> str:
-    value = re.sub(r"[\s\t，,。；;：:（）()《》“”\"'、]+", "", name)
-    value = re.sub(r"^(需提供|提供|出具|由|具备|相关资质的|第三方|检验检测机构|检测机构)+", "", value)
-    value = re.sub(r"(依据|按照|满足|符合).*$", "", value)
-    return normalize_key(f"{value}:{object_term}")[:120]
-
-
-def clean_statistical_object_name(raw: str) -> str:
-    value = re.sub(r"\s+", "", raw)
-    value = re.sub(r"^[，,。；;：:、（）()《》]+|[，,。；;：:、（）()《》]+$", "", value)
-    value = re.sub(r"^(需提供|提供|出具|由|具备|相关资质的|第三方|检验检测机构|检测机构|带有CMA或CNAS标识的)+", "", value)
-    value = re.sub(r"(需提供|提供|出具|检测合格|均检测合格|以佐证|报告查询截图).*$", "", value)
-    if len(value) > 36:
-        value = value[-36:]
-    return value or "未能稳定抽取对象名称"
-
-
-def infer_object_name_before(text: str, position: int) -> str:
-    prefix = text[max(0, position - 500) : position]
-    quoted_name_matches = re.findall(r"[“\"]([^”\"]{1,40})[”\"]\s*的\s*$", prefix)
-    if quoted_name_matches:
-        return quoted_name_matches[-1]
-    quoted_name_matches = re.findall(r"[“\"]([^”\"]{1,40})[”\"]\s*的\s*(?:检验)?检测?$", prefix)
-    if quoted_name_matches:
-        return quoted_name_matches[-1]
-    label_matches = re.findall(r"(?:^|[;；。\t\n])\s*▲?\d+[\.、\s]*([^：:；;。()（）]{2,40})[：:]", prefix)
-    if label_matches:
-        return label_matches[-1]
-    short_label_matches = re.findall(r"(?:^|[;；。\t\n])\s*▲?\d+[\.、\s]*([^，,；;。()（）]{2,24})", prefix)
-    if short_label_matches:
-        return short_label_matches[-1]
-    quoted = re.findall(r"《([^》]{1,40})》", prefix)
-    if quoted:
-        return quoted[-1]
-    material_matches = re.findall(r"(?:所使用|采用|提供|关于)([^，,；;。()（）]{2,40})(?:依据|的|检测|检验)", prefix)
-    material_matches = [value for value in material_matches if "机构" not in value and "资质" not in value]
-    if material_matches:
-        return material_matches[-1]
-    chunks = re.split(r"[。；;，,\t()（）]", prefix)
-    return chunks[-1] if chunks else ""
-
-
-def is_countable_statistical_occurrence(text: str, start: int, end: int) -> bool:
-    before = text[max(0, start - 180) : start]
-    after = text[end : min(len(text), end + 80)]
-    nearby = before + text[start:end] + after
-    after_stripped = after.lstrip()
-    if after_stripped.startswith(("名称", "封面", "查询截图")):
-        return False
-    has_submit_verb = bool(re.search(r"需提供|须提供|应提供|提供|提供由|出具|检测合格|检验合格|以佐证", before))
-    if re.search(r"报告编号|查询截图|应与检测报告一致|与检测报告一致", nearby):
-        return False
-    if "报告名称" in nearby and not has_submit_verb:
-        return False
-    if "该份报告" in before[-30:]:
-        return False
-    return has_submit_verb
-
-
-def extract_statistical_objects_from_window(window: CandidateWindow, object_terms: list[str]) -> list[dict[str, Any]]:
-    objects: list[dict[str, Any]] = []
-    for object_term in object_terms:
-        for match in re.finditer(re.escape(object_term), window.text):
-            if not is_countable_statistical_occurrence(window.text, match.start(), match.end()):
-                continue
-            name = clean_statistical_object_name(infer_object_name_before(window.text, match.start()))
-            evidence_start = max(0, match.start() - 80)
-            evidence_end = min(len(window.text), match.end() + 80)
-            evidence = window.text[evidence_start:evidence_end].strip()
-            objects.append(
-                {
-                    "object_name": name,
-                    "object_term": object_term,
-                    "line_anchor": window.line_anchor,
-                    "window_id": window.window_id,
-                    "dedupe_key": normalized_object_key(name, object_term),
-                    "evidence_text": evidence[:220],
-                }
-            )
-    return objects
-
-
-def build_statistical_review(item: NBDItem, windows: list[CandidateWindow]) -> dict[str, Any]:
-    profile = statistical_review_profile(item)
-    if not profile.get("enabled"):
-        return {"enabled": False}
-    objects: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for window in windows:
-        for obj in extract_statistical_objects_from_window(window, list(profile.get("object_terms") or [])):
-            key = str(obj.get("dedupe_key") or "")
-            if key and key in seen:
-                continue
-            if key:
-                seen.add(key)
-            obj["ordinal"] = len(objects) + 1
-            objects.append(obj)
-    return {
-        **profile,
-        "object_count": len(objects),
-        "objects": objects[:24],
-        "omitted_object_count": max(0, len(objects) - 24),
-        "representative_lines": sorted({obj["line_anchor"] for obj in objects})[:12],
-    }
-
-
 def candidate_set_payload(item: NBDItem, windows: list[CandidateWindow], recall_stats: dict[str, Any]) -> dict[str, Any]:
-    statistical_review = build_statistical_review(item, windows)
     return {
         "schema_version": CANDIDATE_SET_SCHEMA,
         "nbd_id": item.nbd_id,
@@ -679,7 +533,6 @@ def candidate_set_payload(item: NBDItem, windows: list[CandidateWindow], recall_
         "document_ir": "document-ir.json",
         "candidate_count": len(windows),
         "recall_stats": recall_stats,
-        "statistical_review": statistical_review,
         "windows": [asdict(window) for window in windows],
     }
 

@@ -72,7 +72,7 @@ def atomic_candidate_protocol_markdown() -> str:
         [
             "原子化候选输出协议：",
             "- candidate 是行号级证据单元，不是 NBD 汇总结论。一个 candidate 只能承载一个可独立复核的风险事实。",
-            "- 同一候选窗口包含多个评分行、资格条件、证明材料、证书、认证、检测报告、技术参数、合同条款或履约要求时，必须逐行或逐对象拆分判断。",
+            "- 同一候选窗口包含多个可独立复核的审查对象时，必须逐行或逐对象拆分判断。",
             "- 候选窗口的 table_scoring 若列出多个 line_anchor，说明窗口内存在多个独立表格行；正向输出必须优先使用 table_scoring 中的最小行号，而不是直接沿用候选窗口的大范围 line_anchor。",
             "- 当候选窗口 line_anchor 覆盖多行，但 table_scoring 显示每一行都有独立 label、权重或评分准则时，每个满足 NBD SOP 的表格行都应单独输出 candidate。",
             "- 多个风险事实分别满足同一 NBD 命中条件或待复核条件时，应输出多条 candidates；不要把多个行号合并为一条摘要候选。",
@@ -106,47 +106,24 @@ def flatten_focus_terms(hit_words: dict[str, Any]) -> list[str]:
 
 
 def focused_compact_window_text(value: str, max_chars: int, focus_terms: list[str]) -> str:
-    matches: list[int] = []
+    matches: list[tuple[int, int]] = []
     for term in focus_terms:
         pos = value.find(term)
         if pos >= 0:
-            matches.append(pos)
+            matches.append((pos, len(term)))
     if not matches:
         return value[:max_chars].rstrip() + "\n[候选窗口原文已压缩]"
 
     budget = max(120, max_chars)
     snippets: list[tuple[int, str]] = []
     used: list[tuple[int, int]] = []
-    per_snippet = max(90, budget // min(3, len(matches)))
-    evidence_terms = [
-        "不得分",
-        "扣分",
-        "提供",
-        "提交",
-        "检测报告",
-        "检验报告",
-        "证明材料",
-        "证书",
-        "评分",
-        "得分",
-        "资格",
-        "合同",
-        "付款",
-        "验收",
-    ]
-
-    def match_score(pos: int) -> tuple[int, int]:
-        start = max(0, pos - 80)
-        end = min(len(value), pos + 180)
-        snippet = value[start:end]
-        score = sum(2 for term in evidence_terms if term in snippet)
-        if re.search(r"\d+(?:\.\d+)?\s*(?:分|%|日|天|月|年|h|H|小时|个月)", snippet):
-            score += 2
-        if any(word in snippet for word in ["否则", "未提供", "不符合", "不满足"]):
-            score += 2
-        return (-score, pos)
-
-    selected_positions = sorted(sorted(set(matches), key=match_score)[:3])
+    per_snippet = max(90, budget // min(4, len(matches)))
+    selected_positions: list[int] = []
+    for pos, _ in sorted(matches, key=lambda item: (-item[1], item[0])):
+        if all(abs(pos - selected) > per_snippet // 2 for selected in selected_positions):
+            selected_positions.append(pos)
+        if len(selected_positions) >= 4:
+            break
     for pos in selected_positions:
         start = max(0, pos - per_snippet // 3)
         end = min(len(value), start + per_snippet)
@@ -163,6 +140,20 @@ def focused_compact_window_text(value: str, max_chars: int, focus_terms: list[st
     if len(compacted) > max_chars:
         compacted = compacted[:max_chars].rstrip()
     return compacted + "\n[候选窗口原文已按命中词附近压缩]"
+
+
+def render_focus_snippets(text: str, focus_terms: list[str], max_chars: int = 900) -> str:
+    value = str(text or "")
+    if not value or not focus_terms:
+        return "[]"
+    snippet_text = focused_compact_window_text(value, max_chars, focus_terms)
+    snippets = [part.strip() for part in snippet_text.split("\n[命中词附近片段]\n") if part.strip()]
+    cleaned = [
+        part.replace("[候选窗口原文已按命中词附近压缩]", "").strip()
+        for part in snippets
+        if part and not part.startswith("[候选窗口原文")
+    ]
+    return json.dumps(cleaned[:4], ensure_ascii=False)
 
 
 def compact_window_text(text: str, max_chars: int, focus_terms: list[str] | None = None) -> str:
@@ -201,6 +192,7 @@ def render_windows(windows: list[CandidateWindow], max_text_chars: int = 0) -> s
         text = compact_window_text(window.text, max_text_chars, flatten_focus_terms(window.hit_words))
         table_scoring = compact_table_scoring((window.source or {}).get("table_scoring") or [])
         completeness_missing = [key for key, value in window.completeness.items() if not value]
+        focus_terms = flatten_focus_terms(window.hit_words)
         chunks.append(
             "\n".join(
                 [
@@ -222,6 +214,7 @@ def render_windows(windows: list[CandidateWindow], max_text_chars: int = 0) -> s
                     "section_path: " + (" > ".join(window.section_path) if window.section_path else ""),
                     "recall_reason: " + "；".join(window.recall_reason[:4]),
                     "table_scoring: " + json.dumps(table_scoring, ensure_ascii=False),
+                    "focus_snippets: " + render_focus_snippets(window.text, focus_terms),
                     "原文：",
                     text,
                 ]
@@ -267,47 +260,12 @@ def numeric_review_instruction(item: NBDItem) -> str:
     )
 
 
-def statistical_review_markdown(statistical_review: dict[str, Any] | None) -> str:
-    payload = statistical_review or {}
-    if not payload.get("enabled"):
-        return "本 NBD 未生成统计对象清单；按普通候选窗口执行。"
-    threshold = payload.get("threshold")
-    object_count = int(payload.get("object_count") or 0)
-    if isinstance(threshold, int) and object_count <= threshold:
-        return "运行时已生成统计对象调试清单，但清单数量未超过 NBD 阈值；为避免不完整清单干扰判断，当前运行不展示清单，仍按候选窗口和 NBD SOP 执行。"
-    objects = payload.get("objects") or []
-    lines = [
-        "运行时已按候选窗口抽取可统计对象清单。该清单只是辅助盘点，不是命中结论；最终仍必须按 NBD SOP 判断。",
-        f"- 对象族：{payload.get('object_family') or ''}",
-        f"- 去重后对象数：{object_count}",
-        f"- NBD 文本阈值：{threshold if threshold is not None else '未稳定抽取'}",
-        "- 执行要求：逐项判断对象是否应计入 NBD SOP 的统计口径；同一对象重复出现不得重复计数；履约验收、监管抽查、模板格式等排除对象不得计数。",
-        "- 清单可能因候选窗口截断、表格长行或对象名称复杂而不完整；不得仅因本清单对象数未达到阈值就输出不命中。",
-        "- 若清单与候选窗口原文不一致，应以候选窗口原文和 NBD SOP 为准重新统计，并在 summary 或 reason 中说明统计口径。",
-        "- 若计入对象数达到 NBD SOP 的命中条件，candidates 应优先引用下表代表行；若本清单不足以支撑结论，应继续读取候选窗口，不得把清单当作排除条件。",
-        "",
-        "| 序号 | 对象 | 类型 | 行号 | 候选窗口 | 证据片段 |",
-        "|---:|---|---|---|---|---|",
-    ]
-    for obj in objects[:12]:
-        evidence = str(obj.get("evidence_text") or "").replace("\n", " ")[:90]
-        lines.append(
-            f"| {obj.get('ordinal', '')} | {obj.get('object_name', '')} | {obj.get('object_term', '')} | "
-            f"{obj.get('line_anchor', '')} | {obj.get('window_id', '')} | {evidence} |"
-        )
-    omitted = int(payload.get("omitted_object_count") or 0)
-    if omitted:
-        lines.append(f"\n另有 {omitted} 个对象因 prompt 长度未展示，需结合候选窗口判断。")
-    return "\n".join(lines)
-
-
 def build_messages(
     item: NBDItem,
     review_name: str,
     facts: dict[str, Any],
     windows: list[CandidateWindow],
     max_prompt_chars: int,
-    statistical_review: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     rendered_windows = render_windows(windows, window_text_limit(max_prompt_chars, len(windows)))
     system = (
@@ -328,6 +286,11 @@ def build_messages(
         "candidate_count 必须等于实际候选窗口数量。"
         "candidates 只列需要进入审查结果的候选，不要列对比用的不命中候选。"
         "candidates 必须逐项列出所有判定为命中或待人工复核的原子候选，最多 8 项；每个候选必须引用候选窗口中的 candidate_id 和 line_anchor。"
+        "不得把理由中已经判定为不命中、不得命中、触发排除、不构成本 NBD 风险、不进入 candidates 的候选继续写成 candidate_verdict=命中。"
+        "如果 candidate.reason 或 execution_trace 已说明某候选不满足 SOP、仅为排除示例、仅为对比用候选，必须从 candidates 中删除；最终不命中时才可保留少量不命中候选说明排除理由。"
+        "输出 JSON 前必须自检：每一条 candidate_verdict=命中的候选，其 reason 必须正向说明已满足 NBD SOP 命中条件，且 exclusion_triggered 必须为 false。"
+        "candidate_verdict=命中的 reason 必须是确定性结论，不能只写“可能、需确认、需要核实、通常、一般、疑似、倾向、风险较低”等推测性依据；如果只能推测，应改为待人工复核或不命中。"
+        "若 reason 同时包含正向命中语义和反向排除语义，以反向排除语义为准，不得输出为命中 candidate。"
         "如果 verdict 为命中，candidates 中至少必须有 1 项 candidate_verdict 为命中，且该项必须来自候选窗口原文。"
         "如果 verdict 为待人工复核，candidates 中至少必须有 1 项 candidate_verdict 为待人工复核，且该项必须来自候选窗口原文。"
         "如果最终不命中，只列最关键的 1-3 个不命中候选及理由。"
@@ -335,6 +298,7 @@ def build_messages(
         "不得只在 summary 中概括风险而省略 candidates；没有 candidate_id 和 line_anchor 的命中不能作为有效审查结果。"
         "最终 verdict 必须与 execution_trace.result_branch.branch、候选 candidate_verdict、summary 的正反语义一致。"
         "输出必须是严格 JSON。"
+        "JSON 字符串内不要使用未转义的英文双引号；需要举例时改用中文引号、括号或直接省略引号，确保整段内容可被 json.loads 解析。"
     )
     user = f"""
 目标 NBD：{item.nbd_id} {item.title}
@@ -382,9 +346,6 @@ def build_messages(
 
 【数值/表格审查补充要求】
 {numeric_review_instruction(item) or "本 NBD 未识别为数值计算型；仍需按 NBD SOP 判断。"}
-
-【统计对象辅助清单】
-{statistical_review_markdown(statistical_review)}
 
 【判定顺序】
 {decision_protocol_markdown()}
@@ -434,7 +395,7 @@ def write_prompt_files(output_dir: Path, item: NBDItem, messages: list[dict[str,
 def write_prompt_artifact(output_dir: Path, review_name: str, facts: dict[str, Any], item: NBDItem, args: Any) -> list[dict[str, str]]:
     payload = load_candidate_set_payload(output_dir, item)
     windows = [CandidateWindow(**window) for window in payload.get("windows", [])]
-    messages = build_messages(item, review_name, facts, windows, args.max_prompt_chars, payload.get("statistical_review") or {})
+    messages = build_messages(item, review_name, facts, windows, args.max_prompt_chars)
     stats = prompt_stats(item, messages, args.max_prompt_chars)
     write_prompt_files(output_dir, item, messages, stats)
     return messages

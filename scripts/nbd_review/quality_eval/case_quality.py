@@ -24,6 +24,13 @@ from quality_eval.run_roles import write_run_role
 from quality_eval.update_f1_summary import update_summary
 from shared.utils import now_text, relative_path, write_text
 
+VERSION_SPECS = (
+    ("v1", "V1"),
+    ("v2", "V2"),
+    ("v3", "V3"),
+    ("v4", "V4"),
+)
+
 
 def load_metrics(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -55,9 +62,28 @@ def evaluate(gold_json: Path, run_dir: Path, output_dir: Path, line_match: str) 
     }
 
 
+def version_items(payload: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    versions = payload.get("versions")
+    if isinstance(versions, dict) and versions:
+        items: list[tuple[str, dict[str, Any]]] = []
+        for key, label in VERSION_SPECS:
+            metrics = versions.get(key)
+            if isinstance(metrics, dict):
+                items.append((label, metrics))
+        return items
+
+    items = []
+    for key, label in VERSION_SPECS:
+        metrics = payload.get(key)
+        if isinstance(metrics, dict):
+            items.append((label, metrics))
+    return items
+
+
 def render_summary(payload: dict[str, Any]) -> str:
-    v1 = payload.get("v1") or {}
-    v2 = payload.get("v2") or {}
+    versions = version_items(payload)
+    final_label = versions[-1][0] if versions else "V2"
+    final_metrics = versions[-1][1] if versions else {}
     lines = [
         "# 单案例质量评测流水线报告",
         "",
@@ -73,7 +99,7 @@ def render_summary(payload: dict[str, Any]) -> str:
         "| 口径 | 标准答案数 | 忽略新增数 | 工程输出数 | 匹配成功数 | 召回率 | 精确率 | F1 值 | 漏报数 | 误报数 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for label, metrics in (("V1", v1), ("V2", v2)):
+    for label, metrics in versions:
         lines.append(
             "| "
             + " | ".join(
@@ -92,16 +118,27 @@ def render_summary(payload: dict[str, Any]) -> str:
             )
             + " |"
         )
-    status = "达标" if float(v2.get("f1") or 0) >= float(payload.get("target_f1") or 0) else "未达标"
+    status = "达标" if float(final_metrics.get("f1") or 0) >= float(payload.get("target_f1") or 0) else "未达标"
     lines.extend(
         [
             "",
             "## 结论",
             "",
-            f"- F1-V2 状态：{status}。",
+            f"- F1-{final_label} 状态：{status}。",
             f"- 工程标准答案格式 JSON：`{payload.get('gold_like_json', '')}`",
-            f"- V1 评测目录：`{payload.get('evaluation_v1_dir', '')}`",
-            f"- V2 评测目录：`{payload.get('evaluation_v2_dir', '')}`",
+        ]
+    )
+    for label, _metrics in versions:
+        eval_dir = payload.get(f"evaluation_{label.lower()}_dir", "")
+        if eval_dir:
+            lines.append(f"- {label} 评测目录：`{eval_dir}`")
+    lines.extend(
+        [
+            "",
+            "## 版本说明",
+            "",
+            f"- 当前主判定口径：{final_label}。",
+            "- 若存在 V3/V4，表示已进入建设治理层的金标演化过程。",
         ]
     )
     if payload.get("summary_md"):
@@ -118,10 +155,21 @@ def run_case_quality(args: argparse.Namespace) -> dict[str, Any]:
     data = build_gold_like(run_dir, include_no_line=args.include_no_line)
     write_json(gold_like_path, data)
 
-    v1_dir = run_dir / "evaluation-v1"
-    v2_dir = run_dir / "evaluation-v2"
-    v1_metrics = evaluate(args.gold_v1.resolve(), run_dir, v1_dir, args.line_match)
-    v2_metrics = evaluate(args.gold_v2.resolve(), run_dir, v2_dir, args.line_match)
+    version_paths = [
+        ("v1", args.gold_v1),
+        ("v2", args.gold_v2),
+        ("v3", args.gold_v3),
+        ("v4", args.gold_v4),
+    ]
+    versions: dict[str, dict[str, Any]] = {}
+    evaluation_dirs: dict[str, str] = {}
+    for key, path in version_paths:
+        if not path:
+            continue
+        eval_dir = run_dir / f"evaluation-{key}"
+        metrics = evaluate(path.resolve(), run_dir, eval_dir, args.line_match)
+        versions[key] = metrics
+        evaluation_dirs[key] = str(eval_dir)
 
     if args.case_no or args.sample_name or args.item_category:
         write_run_role(
@@ -137,7 +185,8 @@ def run_case_quality(args: argparse.Namespace) -> dict[str, Any]:
     if args.summary_md:
         status = args.status
         if not status:
-            status = "专项完成" if v2_metrics["f1"] >= args.target_f1 else "专项进行中"
+            primary_metrics = versions.get("v2") or versions.get("v4") or next(iter(versions.values()), {})
+            status = "专项完成" if float(primary_metrics.get("f1") or 0) >= args.target_f1 else "专项进行中"
         totals = update_summary(
             summary_path=args.summary_md.resolve(),
             case_no=args.case_no,
@@ -156,15 +205,27 @@ def run_case_quality(args: argparse.Namespace) -> dict[str, Any]:
         "target_f1": args.target_f1,
         "gold_v1": str(args.gold_v1.resolve()),
         "gold_v2": str(args.gold_v2.resolve()),
+        "gold_v3": str(args.gold_v3.resolve()) if args.gold_v3 else "",
+        "gold_v4": str(args.gold_v4.resolve()) if args.gold_v4 else "",
         "gold_like_json": str(gold_like_path),
-        "evaluation_v1_dir": str(v1_dir),
-        "evaluation_v2_dir": str(v2_dir),
+        "evaluation_v1_dir": evaluation_dirs.get("v1", ""),
+        "evaluation_v2_dir": evaluation_dirs.get("v2", ""),
+        "evaluation_v3_dir": evaluation_dirs.get("v3", ""),
+        "evaluation_v4_dir": evaluation_dirs.get("v4", ""),
+        "evaluation_dirs": evaluation_dirs,
         "summary_md": str(args.summary_md.resolve()) if args.summary_md else "",
         "role": args.role,
         "notes": args.notes,
-        "v1": v1_metrics,
-        "v2": v2_metrics,
+        "versions": versions,
     }
+    if "v1" in versions:
+        payload["v1"] = versions["v1"]
+    if "v2" in versions:
+        payload["v2"] = versions["v2"]
+    if "v3" in versions:
+        payload["v3"] = versions["v3"]
+    if "v4" in versions:
+        payload["v4"] = versions["v4"]
     if totals:
         v1_total, v2_total = totals
         payload["summary_totals"] = {
@@ -183,6 +244,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--gold-v1", required=True, type=Path)
     parser.add_argument("--gold-v2", required=True, type=Path)
+    parser.add_argument("--gold-v3", type=Path)
+    parser.add_argument("--gold-v4", type=Path)
     parser.add_argument("--case-no", type=int)
     parser.add_argument("--sample-name", default="")
     parser.add_argument("--item-category", default="")
@@ -202,9 +265,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     payload = run_case_quality(parse_args())
-    print(relative_path(Path(payload["evaluation_v2_dir"])))
-    print(f"V1_F1={payload['v1']['f1']:.4f}")
-    print(f"V2_F1={payload['v2']['f1']:.4f}")
+    print(relative_path(Path(payload["evaluation_v2_dir"] or payload["evaluation_v1_dir"])))
+    for label in ("v1", "v2", "v3", "v4"):
+        metrics = payload.get(label)
+        if isinstance(metrics, dict):
+            print(f"{label.upper()}_F1={metrics['f1']:.4f}")
     return 0
 
 

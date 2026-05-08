@@ -14,9 +14,16 @@ from pathlib import Path
 from typing import Any
 
 from shared.schemas import MODEL_REVIEW_RESULT_SCHEMA, CandidateWindow, DocumentBlock, NBDItem
-from business_review.postprocessor import dedupe_model_candidates, model_quality_flags, repair_verdict_candidate_consistency
+from business_review.postprocessor import (
+    dedupe_model_candidates,
+    model_quality_flags,
+    prune_output_constraint_violations,
+    prune_self_rejected_positive_candidates,
+    repair_verdict_candidate_consistency,
+)
 from business_review.prompt_runner import build_messages, prompt_stats, read_prompt_messages, write_prompt_files
 from business_review.recall_runner import build_candidate_windows, candidate_set_payload, load_candidate_set_payload
+from business_review.nbd_compiler import parse_output_constraints
 from shared.utils import now_text, read_text, relative_path, run_path, vcc, write_text
 
 def artifact_refs(output_dir: Path, item: NBDItem) -> dict[str, str]:
@@ -60,6 +67,12 @@ def normalize_nbd_result(result: dict[str, Any], item: NBDItem) -> dict[str, Any
     return result
 
 
+def output_constraints_for(item: NBDItem) -> dict[str, Any]:
+    if isinstance(item.meta.get("_output_constraints"), dict):
+        return dict(item.meta.get("_output_constraints") or {})
+    return parse_output_constraints(item.markdown)
+
+
 def write_model_result_artifact(
     output_dir: Path,
     review_file: Path,
@@ -94,8 +107,11 @@ def write_model_result_artifact(
         "candidate_window_count": len(windows),
         "recall_stats": recall_stats,
         "windows": [asdict(window) for window in windows],
+        "output_constraints": output_constraints_for(item),
         "model_result": model_result,
     }
+    prune_self_rejected_positive_candidates(report)
+    prune_output_constraint_violations(report)
     repair_verdict_candidate_consistency(report)
     dedupe_model_candidates(report)
     flags = model_quality_flags(report)
@@ -220,7 +236,7 @@ def run_one_item(args: Any, review_file: Path, output_dir: Path, blocks: list[Do
     candidate_file = output_dir / "candidates" / f"{item.nbd_id}.json"
     candidate_payload = candidate_set_payload(item, windows, recall_stats)
     write_text(candidate_file, json.dumps(candidate_payload, ensure_ascii=False, indent=2) + "\n")
-    messages = build_messages(item, review_file.name, facts, windows, args.max_prompt_chars, candidate_payload.get("statistical_review") or {})
+    messages = build_messages(item, review_file.name, facts, windows, args.max_prompt_chars)
     write_prompt_files(output_dir, item, messages, prompt_stats(item, messages, args.max_prompt_chars))
     raw_response_file = output_dir / "raw-responses" / f"{item.nbd_id}.json"
     started_at = now_text()
@@ -239,8 +255,11 @@ def run_one_item(args: Any, review_file: Path, output_dir: Path, blocks: list[Do
         "candidate_window_count": len(windows),
         "recall_stats": recall_stats,
         "windows": [asdict(window) for window in windows],
+        "output_constraints": output_constraints_for(item),
         "model_result": model_result,
     }
+    prune_self_rejected_positive_candidates(report)
+    prune_output_constraint_violations(report)
     repair_verdict_candidate_consistency(report)
     dedupe_model_candidates(report)
     flags = model_quality_flags(report)

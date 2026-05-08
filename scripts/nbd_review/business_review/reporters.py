@@ -18,6 +18,8 @@ from business_review.postprocessor import (
     issue_types,
     model_quality_flags,
     dedupe_model_candidates,
+    prune_output_constraint_violations,
+    prune_self_rejected_positive_candidates,
     prune_support_positive_candidates,
     repair_positive_candidate_structure,
     repair_verdict_candidate_consistency,
@@ -32,6 +34,8 @@ def write_report_artifacts(output_dir: Path, results: list[dict[str, Any]] | Non
     if results is None:
         results = [json.loads(read_text(path)) for path in sorted((output_dir / "items").glob("*/result.json"))]
     for row in results:
+        prune_self_rejected_positive_candidates(row)
+        prune_output_constraint_violations(row)
         repair_verdict_candidate_consistency(row)
         repair_positive_candidate_structure(row)
         dedupe_model_candidates(row)
@@ -216,7 +220,7 @@ def _family_counts(groups: list[dict[str, Any]]) -> dict[str, int]:
 
 def _render_family_counts(groups: list[dict[str, Any]]) -> list[str]:
     counts = _family_counts(groups)
-    labels = ["资格条件", "评分规则", "样品检测", "技术参数", "商务合同", "政府采购政策", "其他"]
+    labels = sorted(counts, key=lambda label: (label == "其他", label))
     return [f"- {label}：{counts.get(label, 0)}" for label in labels if counts.get(label, 0)]
 
 

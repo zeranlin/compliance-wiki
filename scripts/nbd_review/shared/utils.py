@@ -79,6 +79,15 @@ def looks_like_heading(text: str) -> bool:
     value = text.strip()
     if not value or len(value) > 80 or "\t" in value:
         return False
+    compact_value = re.sub(r"\s+", "", value)
+    if re.match(r"^[0-9]+[.．、]", value) and (
+        "；" in value
+        or ";" in value
+        or "（" in value
+        or "，" in value
+        or any(word in compact_value for word in ["本项目", "投标人", "供应商", "提供", "不得", "不接受", "接受"])
+    ):
+        return False
     return bool(
         re.match(r"^(第[一二三四五六七八九十0-9]+[章节册部分条]|[一二三四五六七八九十]+[、.．]|[0-9]+[.．、])", value)
         or value in {"评标信息", "商务要求", "用户需求书", "采购需求", "招标公告", "目录"}

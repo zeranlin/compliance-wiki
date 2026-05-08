@@ -355,12 +355,6 @@ def infer_section_role(text: str, current_role: str) -> tuple[str, float, list[s
     ):
         return "scoring", 0.78, ["命中评分表行结构：分值/证明文件/考察内容"]
     if (
-        re.search(r"▲|检测依据|检验依据|检测报告|检验报告|检测项目|技术参数", ctext)
-        and re.search(r"提供|须提供|应提供|不得分|负偏离|技术要求|参数", ctext)
-        and not re.search(r"样品.{0,20}(递交|提交|放置|退回|授权委托|清单)", ctext)
-    ):
-        return "technical_primary", 0.82, ["命中技术参数/检测报告正式证据行"]
-    if (
         current_role in {"qualification", "qualification_primary", "announcement"}
         and re.search(r"(供应商|投标人).{0,12}(须|必须|应|需|不低于|不得|不予|无效|不通过)", ctext)
         and not re.search(r"得\d*(?:\.\d+)?分|不得分|评分|评审|加分|扣分", ctext)
